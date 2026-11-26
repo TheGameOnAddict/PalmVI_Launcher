@@ -1,6 +1,6 @@
 [package]
 name = "mandyhub"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Mandyhub: a community launcher for VIctory-based projects: pick a repo from PortWatch or a custom link, check the game files, build and play."
 license = "GPL-3.0-or-later"
@@ -11,7 +11,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ureq = { version = "2.10", features = ["json"] }
 rfd = "0.14"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm"] }
+ring = "0.17"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [profile.release]

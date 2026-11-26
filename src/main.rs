@@ -15,6 +15,8 @@ mod theme;
 mod tools;
 mod ui;
 mod saves;
+mod build_activity;
+mod updater;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -84,6 +86,91 @@ struct Saved {
     warm_pipelines: bool,
     /// Extra arguments for `victory run`; the game's own go after `--`.
     launch_args: String,
+    project_launch: std::collections::BTreeMap<String, ProjectLaunch>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
+struct ProjectLaunch {
+    args: Option<String>,
+    switches: Option<String>,
+    graphics: Option<GraphicsSettings>,
+    notes: String,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct GraphicsSettings {
+    series_s: bool,
+    render_scale: f32,
+    fix_8gb: bool,
+    bright_shadows: bool,
+    fullscreen: bool,
+}
+
+impl Saved {
+    fn default_graphics(&self) -> GraphicsSettings {
+        GraphicsSettings {
+            series_s: self.series_s,
+            render_scale: self.render_scale,
+            fix_8gb: self.fix_8gb,
+            bright_shadows: self.bright_shadows,
+            fullscreen: self.fullscreen,
+        }
+    }
+
+    fn graphics_for(&self, repo: &str) -> GraphicsSettings {
+        self.project_launch.get(&repo.to_ascii_lowercase())
+            .and_then(|project| project.graphics)
+            .unwrap_or_else(|| self.default_graphics())
+    }
+
+    fn launch_overrides(&self, repo: &str) -> (Vec<String>, String) {
+        let graphics = self.graphics_for(repo);
+        let project = self.project_launch.get(&repo.to_ascii_lowercase());
+        let args = project.and_then(|p| p.args.as_deref()).unwrap_or(&self.launch_args);
+        let switches = project.and_then(|p| p.switches.as_deref());
+        let mut extra = switches.map_or_else(|| self.extra_env.clone(), |_| String::new());
+        if graphics.fix_8gb {
+            extra.push_str("\nVICTORY_TEXTURE_DROP_MIPS=2\nVICTORY_NULL_COLOR=grey");
+        }
+        if graphics.bright_shadows {
+            extra.push_str("\nVICTORY_AMBIENT=0.6");
+        }
+        if let Some(switches) = switches {
+            extra.push('\n');
+            extra.push_str(switches);
+        }
+        (split_args(args), extra)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn project_launch_overrides_are_independent_and_can_be_empty() {
+    let mut saved = Saved {
+        launch_args: "--strict".into(),
+        extra_env: "VICTORY_GLOBAL=1".into(),
+        ..Saved::default()
+    };
+    saved.project_launch.insert("owner/test".into(), ProjectLaunch {
+        args: Some(String::new()),
+        switches: None,
+        ..ProjectLaunch::default()
+    });
+    assert_eq!(saved.launch_overrides("Owner/Test"), (Vec::new(), "VICTORY_GLOBAL=1".into()));
+    saved.project_launch.get_mut("owner/test").unwrap().switches = Some("VICTORY_LOCAL=1".into());
+    assert_eq!(saved.launch_overrides("owner/test"), (Vec::new(), "\nVICTORY_LOCAL=1".into()));
+    assert_eq!(saved.launch_overrides("owner/other"), (vec!["--strict".into()], "VICTORY_GLOBAL=1".into()));
+    let mut graphics = saved.default_graphics();
+    graphics.series_s = true;
+    graphics.render_scale = 0.5;
+    graphics.fix_8gb = true;
+    graphics.fullscreen = true;
+    saved.project_launch.get_mut("owner/test").unwrap().graphics = Some(graphics);
+    assert!(saved.graphics_for("Owner/Test").fullscreen);
+    assert!(!saved.graphics_for("owner/other").fullscreen);
+    assert!(saved.launch_overrides("owner/test").1.contains("VICTORY_TEXTURE_DROP_MIPS=2"));
+    assert!(!saved.launch_overrides("owner/other").1.contains("VICTORY_TEXTURE_DROP_MIPS"));
 }
 
 /// Shared state of the background job (download, build, play).
@@ -162,6 +249,7 @@ mod tests {
 
 struct App {
     saved: Saved,
+    updater: updater::Updater,
     projects: Arc<Mutex<Option<Result<Vec<Project>, String>>>>,
     job: Arc<Mutex<Job>>,
     files: Vec<(&'static str, bool)>,
@@ -232,6 +320,7 @@ struct RepoState {
     built: Option<String>,
     /// The newest commit online (`None` while unknown or unreachable).
     remote: Option<String>,
+    activity: Option<build_activity::BuildActivity>,
 }
 
 /// What the background job does.
@@ -255,8 +344,59 @@ fn target_dir(repo: &str) -> PathBuf {
 }
 fn built_exe(repo: &str) -> PathBuf {
     let dir = repo_dir(repo);
-    let profile = detect_build_profile(&dir);
-    target_dir(repo).join(profile).join("victory.exe")
+    let workspace = cargo_workspace(&dir).unwrap_or_else(|_| dir.clone());
+    let target = target_dir(repo);
+    let executable = target.join(detect_build_profile(&workspace)).join("victory.exe");
+    let previous = target.join("release").join("victory.exe");
+    if workspace != dir && !executable.is_file() && previous.is_file() {
+        return previous;
+    }
+    executable
+}
+
+/// Most projects build at the root. Some wrap a VIctory workspace one level down.
+fn cargo_workspace(repo: &Path) -> Result<PathBuf, String> {
+    if repo.join("Cargo.toml").is_file() {
+        return Ok(repo.to_owned());
+    }
+    let entries = std::fs::read_dir(repo).map_err(|error| format!("Could not inspect {}: {error}", repo.display()))?;
+    let mut matches = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Could not inspect {}: {error}", repo.display()))?;
+        let path = entry.path();
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && path.join("Cargo.toml").is_file()
+            && path.join("apps/victory/Cargo.toml").is_file()
+        {
+            matches.push(path);
+        }
+    }
+    match matches.as_slice() {
+        [workspace] => Ok(workspace.clone()),
+        [] => Err(format!("No Cargo.toml at {} and no nested VIctory workspace found.", repo.display())),
+        _ => Err(format!("Multiple nested VIctory workspaces found in {}.", repo.display())),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn finds_a_unique_nested_victory_workspace_and_prefers_the_root() {
+    let root = std::env::temp_dir().join(format!("mandyhub-workspace-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let nested = root.join("cool_fox");
+    std::fs::create_dir_all(nested.join("apps/victory")).unwrap();
+    std::fs::write(nested.join("Cargo.toml"), "[profile.diag]").unwrap();
+    std::fs::write(nested.join("apps/victory/Cargo.toml"), "").unwrap();
+    assert_eq!(cargo_workspace(&root).unwrap(), nested);
+    assert_eq!(detect_build_profile(&nested), "diag");
+    let other = root.join("other");
+    std::fs::create_dir_all(other.join("apps/victory")).unwrap();
+    std::fs::write(other.join("Cargo.toml"), "").unwrap();
+    std::fs::write(other.join("apps/victory/Cargo.toml"), "").unwrap();
+    assert!(cargo_workspace(&root).is_err());
+    std::fs::write(root.join("Cargo.toml"), "").unwrap();
+    assert_eq!(cargo_workspace(&root).unwrap(), root);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// Checks a cloned repo's Cargo.toml for a custom build profile (e.g. `diag`).
@@ -315,13 +455,14 @@ fn remote_head(p: &Project) -> Option<String> {
 
 fn repo_state(p: &Project) -> RepoState {
     if let Some(exe) = &p.local_exe {
-        return RepoState { checking: false, installed: Path::new(exe).is_file(), built: Some("local".into()), remote: None };
+        return RepoState { installed: Path::new(exe).is_file(), built: Some("local".into()), ..RepoState::default() };
     }
     RepoState {
         checking: false,
         installed: built_exe(&p.repo).is_file(),
         built: std::fs::read_to_string(built_file(&p.repo)).ok().map(|s| s.trim().to_string()),
         remote: remote_head(p),
+        activity: build_activity::BuildActivity::read(&target_dir(&p.repo)),
     }
 }
 
@@ -563,6 +704,7 @@ impl App {
         }
         let mut app = App {
             saved,
+            updater: updater::Updater::default(),
             projects: Arc::new(Mutex::new(None)),
             job: Arc::new(Mutex::new(Job::default())),
             files: Vec::new(),
@@ -713,27 +855,22 @@ impl App {
         }
         // An install over an installed project is an update.
         let updating = kind == Kind::Install && built_exe(&p.repo).is_file();
-        let mut extra = self.saved.extra_env.clone();
-        if self.saved.fix_8gb {
-            extra.push_str("\nVICTORY_TEXTURE_DROP_MIPS=2\nVICTORY_NULL_COLOR=grey");
-        }
-        if self.saved.bright_shadows {
-            extra.push_str("\nVICTORY_AMBIENT=0.6");
-        }
+        let (args, extra) = self.saved.launch_overrides(&p.repo);
+        let graphics = self.saved.graphics_for(&p.repo);
         let launch = Launch {
             game_dir: PathBuf::from(&self.saved.game_dir),
-            series_s: self.saved.series_s,
-            scale: self.saved.render_scale,
+            series_s: graphics.series_s,
+            scale: graphics.render_scale,
             extra,
-            fullscreen: self.saved.fullscreen,
+            fullscreen: graphics.fullscreen,
             warm_first: self.saved.warm_before_play,
             pipelines: self.saved.warm_pipelines,
-            args: split_args(&self.saved.launch_args),
+            args,
         };
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
             let r = match &kind {
-                Kind::Install => install(&job, &ctx, &p),
+                Kind::Install => install(&job, &ctx, &p, updating),
                 Kind::Play(choice) => play(&job, &ctx, &p, &launch, choice),
                 Kind::Uninstall => uninstall(&job, &ctx, &p),
                 Kind::Warm => warm(&job, &ctx, &p, &launch),
@@ -769,6 +906,10 @@ impl App {
             if matches!(kind, Kind::Install | Kind::Uninstall) {
                 let st = repo_state(&p);
                 repos.lock().unwrap().insert(p.repo.clone(), st);
+            } else if matches!(kind, Kind::Play(_)) && p.local_exe.is_none() {
+                if let Some(state) = repos.lock().unwrap().get_mut(&p.repo) {
+                    state.activity = build_activity::BuildActivity::read(&target_dir(&p.repo));
+                }
             }
             ctx.request_repaint();
         });
@@ -785,7 +926,7 @@ fn stage(job: &Arc<Mutex<Job>>, ctx: &egui::Context, s: &str) {
 
 /// Downloads `p` (or its newest version) and builds it, once; it stays
 /// installed until the player updates it.
-fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<(), String> {
+fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, updating: bool) -> Result<(), String> {
     let ws = workspace();
     std::fs::create_dir_all(ws.join("repos")).map_err(|e| format!("cannot make {}: {e}", ws.display()))?;
     let dir = repo_dir(&p.repo);
@@ -807,24 +948,32 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<()
     }
     stage(job, ctx, "Building (the first time takes several minutes)");
     let target = target_dir(&p.repo);
-    let profile = detect_build_profile(&dir);
-    let has_lockfile = dir.join("Cargo.lock").is_file();
+    let workspace = cargo_workspace(&dir)?;
+    let profile = detect_build_profile(&workspace);
+    let has_lockfile = workspace.join("Cargo.lock").is_file();
     let mut cargo = tools::cargo();
     cargo.args(["build", "--profile", profile, "-p", "victory", "--target-dir"]);
     cargo.arg(&target);
     if has_lockfile {
         cargo.arg("--locked");
     }
-    cargo.current_dir(&dir);
+    cargo.current_dir(&workspace);
     run(job, ctx, &mut cargo)?;
-    if !built_exe(&p.repo).is_file() {
-        return Err(format!("the build made no {}", built_exe(&p.repo).display()));
+    let executable = target.join(profile).join("victory.exe");
+    if !executable.is_file() {
+        return Err(format!("the build made no {}", executable.display()));
     }
     let mut c = tools::git();
     c.args(["rev-parse", "HEAD"]).current_dir(&dir);
     hide_window(&mut c);
     if let Ok(out) = c.output() {
-        let _ = std::fs::write(built_file(&p.repo), String::from_utf8_lossy(&out.stdout).trim());
+        if out.status.success() {
+            let record = std::fs::write(built_file(&p.repo), String::from_utf8_lossy(&out.stdout).trim())
+                .and_then(|_| build_activity::BuildActivity::record_build(&target, updating));
+            if let Err(error) = record {
+                job.lock().unwrap().log.push(format!("Could not record the update: {error}"));
+            }
+        }
     }
     Ok(())
 }
@@ -977,6 +1126,11 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
     }
     let fullscreen = l.fullscreen;
     run_with(job, ctx, &mut c, |pid| {
+        if p.local_exe.is_none() {
+            if let Err(error) = build_activity::BuildActivity::record_run(&target_dir(&p.repo)) {
+                job.lock().unwrap().log.push(format!("Could not record the launch: {error}"));
+            }
+        }
         if fullscreen {
             fullscreen::keep_borderless(pid);
         }

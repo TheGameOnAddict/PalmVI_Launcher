@@ -5,7 +5,7 @@
 
 use crate::theme::{self, glyph, Look, Size, Stat};
 use crate::{built_exe, default_workspace, parse_repo, search_drives, slides, tools, workspace};
-use crate::{AddRepo, App, Kind, Project, RepoState, View};
+use crate::{AddRepo, App, GraphicsSettings, Kind, Project, RepoState, View};
 use eframe::egui::{self, vec2, Align, Color32, Frame, Label, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::time::Duration;
 
@@ -25,6 +25,33 @@ fn note(ui: &mut Ui, text: &str) {
 
 fn wrapped(ui: &mut Ui, text: &str, color: Color32) {
     ui.add(Label::new(RichText::new(text).font(theme::regular(14.0)).color(color)).wrap());
+}
+
+fn graphics_mode(graphics: GraphicsSettings) -> Option<usize> {
+    MODES.iter().position(|(_, series_s, scale, _)| {
+        graphics.series_s == *series_s && (!*series_s || (graphics.render_scale - scale).abs() < 0.01)
+    })
+}
+
+fn graphics_controls(ui: &mut Ui, graphics: &mut GraphicsSettings) {
+    ui.horizontal_wrapped(|ui| {
+        let names = MODES.map(|mode| mode.0);
+        if let Some(i) = theme::segmented(ui, "graphics-mode", &names, graphics_mode(*graphics), None) {
+            graphics.series_s = MODES[i].1;
+            graphics.render_scale = MODES[i].2;
+        }
+        let description = graphics_mode(*graphics).map_or_else(
+            || format!("Render scale: {:.0}%.", graphics.render_scale * 100.0),
+            |i| MODES[i].3.to_owned(),
+        );
+        note(ui, &description);
+    });
+    ui.add_space(20.0);
+    theme::toggle(ui, &mut graphics.fix_8gb, "8 GB graphics card fix", "Smaller textures, and grey in place of missing ones.");
+    ui.add_space(14.0);
+    theme::toggle(ui, &mut graphics.bright_shadows, "Brighter shadows", "A steady ambient light where ray tracing does not run.");
+    ui.add_space(14.0);
+    theme::toggle(ui, &mut graphics.fullscreen, "Borderless fullscreen", "The game's window covers its whole monitor, with no frame.");
 }
 
 /// A list heading, in line with the text of the rows under it.
@@ -191,7 +218,7 @@ impl App {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let label = format!("Graphics: {}", self.mode_name());
+                        let label = format!("Default graphics: {}", self.mode_name());
                         if theme::small(ui, Look::Ghost, Some(glyph::SETTINGS), &label, true).clicked() {
                             self.view = View::Settings;
                         }
@@ -213,6 +240,13 @@ impl App {
         if let Some(i) = theme::segmented(ui, "gpu", &["All", "NVIDIA", "AMD"], Some(self.saved.gpu_filter.min(2)), Some(w)) {
             self.saved.gpu_filter = i;
         }
+        ui.horizontal_wrapped(|ui| {
+            theme::dot(ui, theme::GOOD);
+            note(ui, "New install to try");
+            ui.add_space(6.0);
+            theme::dot(ui, theme::PINK);
+            note(ui, "Update to try");
+        });
 
         let query = self.search.trim().to_lowercase();
         let filter = self.saved.gpu_filter;
@@ -325,7 +359,12 @@ impl App {
 
         // Left: the name, with a tick when PortWatch verified it.
         let tick_w = if p.verified && theme::has_icons() { 18.0 } else { 0.0 };
-        let name = theme::one_line(ui, &p.name, theme::strong(14.5), theme::WHITE, right - left - fps_w - tick_w);
+        let state = self.state_of(&p.repo);
+        let pending = state.as_ref().filter(|state| state.installed)
+            .and_then(|state| state.activity.as_ref())
+            .and_then(|activity| activity.pending_label());
+        let dot_w = if pending.is_some() { 14.0 } else { 0.0 };
+        let name = theme::one_line(ui, &p.name, theme::strong(14.5), theme::WHITE, right - left - fps_w - tick_w - dot_w);
         let name_size = name.size();
         let y1 = rect.top() + 10.0;
         painter.galley(egui::pos2(left, y1), name, theme::WHITE);
@@ -333,6 +372,15 @@ impl App {
             let at = egui::pos2(left + name_size.x + 6.0, y1 + name_size.y / 2.0 + 1.0);
             let tick = painter.text(at, egui::Align2::LEFT_CENTER, glyph::CHECK, theme::glyphs(11.0), theme::GOOD);
             ui.interact(tick.expand(4.0), resp.id.with("tick"), Sense::hover()).on_hover_text("Verified by PortWatch");
+        }
+        if pending.is_some() {
+            let at = egui::pos2(left + name_size.x + tick_w + 8.0, y1 + name_size.y / 2.0 + 1.0);
+            let color = if state.as_ref().and_then(|state| state.activity.as_ref()).is_some_and(|activity| activity.new_install) {
+                theme::GOOD
+            } else {
+                theme::PINK
+            };
+            painter.circle_filled(at, 3.0, color);
         }
 
         // Under it, one line: where it stands when that matters, else its repo.
@@ -350,7 +398,8 @@ impl App {
                 painter.galley(egui::pos2(left, y2), repo, theme::FAINT);
             }
         }
-        resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        if let Some(label) = pending { resp.on_hover_text(label) } else { resp }
     }
 
     /// Where a project stands, when that is more than "listed".
@@ -364,7 +413,7 @@ impl App {
         if self.update_for(p).is_some() {
             return Some(("Update ready".into(), theme::WARN));
         }
-        if self.state_of(&p.repo).is_some_and(|s| s.installed) {
+        if self.state_of(&p.repo).is_some_and(|state| state.installed) {
             return Some(("Installed".into(), theme::GOOD));
         }
         None
@@ -418,7 +467,7 @@ impl App {
                 ui.set_opacity(enter);
                 ui.add_space(10.0 * (1.0 - enter));
                 self.page_header(ui, ctx, &p);
-                self.page_body(ui, ctx, &p);
+                self.profile_tabs(ui, ctx, &p);
                 ui.add_space(36.0);
                 self.activity(ui);
             });
@@ -459,7 +508,7 @@ impl App {
         let url = format!("https://github.com/{}", p.repo);
         let now = ctx.input(|i| i.time);
 
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (icon, label) = if this_job {
                 (None, short_stage(&stage))
@@ -492,9 +541,29 @@ impl App {
                 ctx.copy_text(url.clone());
                 self.copied_at = now;
             }
+            ui.push_id(&p.repo, |ui| self.project_graphics_menu(ui, &p.repo));
         });
 
         ui.add_space(8.0);
+        if installed {
+            if let Some(activity) = &st.activity {
+                ui.horizontal_wrapped(|ui| {
+                    let updated = if activity.new_install {
+                        activity.updated_ago().replacen("Updated", "Installed", 1)
+                    } else {
+                        activity.updated_ago()
+                    };
+                    note(ui, &updated);
+                    if activity.pending_label().is_some() {
+                        note(ui, "· Not run yet");
+                    }
+                    #[cfg(windows)]
+                    if let Some(last_run) = activity.last_run.and_then(crate::build_activity::local_time) {
+                        note(ui, &format!("· Last run {last_run}"));
+                    }
+                });
+            }
+        }
         let other = job_repo.as_ref().and_then(|r| self.all_projects().into_iter().find(|q| &q.repo == r)).map(|q| q.name);
         ui.horizontal_wrapped(|ui| {
             if this_job {
@@ -645,6 +714,101 @@ impl App {
                 ui.add(Label::new(RichText::new(&p.summary).font(theme::regular(15.0)).color(theme::BLUSH)).wrap());
             });
         }
+    }
+
+    fn profile_tabs(&mut self, ui: &mut Ui, ctx: &egui::Context, project: &Project) {
+        ui.add_space(20.0);
+        let tab_key = format!("project-profile-tab:{}", project.repo);
+        let id = egui::Id::new(&tab_key);
+        let mut tab = ctx.data(|data| data.get_temp::<usize>(id)).unwrap_or_default();
+        if let Some(selected) = theme::segmented(ui, &tab_key, &["Overview", "Profile notes", "Launch settings"], Some(tab), None) {
+            tab = selected;
+            ctx.data_mut(|data| data.insert_temp(id, selected));
+        }
+        match tab {
+            1 => {
+                ui.add_space(12.0);
+                self.project_notes(ui, project);
+            }
+            2 => {
+                ui.add_space(12.0);
+                self.project_launch_card(ui, project);
+            }
+            _ => self.page_body(ui, ctx, project),
+        }
+        let key = project.repo.to_ascii_lowercase();
+        if self.saved.project_launch.get(&key).is_some_and(|launch| {
+            launch.args.is_none() && launch.switches.is_none() && launch.graphics.is_none() && launch.notes.is_empty()
+        }) {
+            self.saved.project_launch.remove(&key);
+        }
+    }
+
+    fn project_graphics_menu(&mut self, ui: &mut Ui, repo: &str) {
+        let default_graphics = self.saved.default_graphics();
+        let key = repo.to_ascii_lowercase();
+        let label = if self.saved.project_launch.get(&key).is_some_and(|launch| launch.graphics.is_some()) {
+            "Graphics · Custom"
+        } else {
+            "Graphics · Default"
+        };
+        ui.menu_button(label, |ui| {
+            ui.set_width(340.0);
+            let launch = self.saved.project_launch.entry(key).or_default();
+            let mut custom = launch.graphics.is_some();
+            if ui.checkbox(&mut custom, "Override default graphics").changed() {
+                launch.graphics = custom.then_some(default_graphics);
+            }
+            if let Some(graphics) = &mut launch.graphics {
+                ui.add_space(12.0);
+                ui.push_id("project-graphics", |ui| graphics_controls(ui, graphics));
+            }
+        });
+    }
+
+    fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {
+        let global_args = &self.saved.launch_args;
+        let global_switches = &self.saved.extra_env;
+        let launch = self.saved.project_launch.entry(project.repo.to_ascii_lowercase()).or_default();
+        section(ui, "Project launch settings", None, "Applies to this project only. Each field can use its global default or a project-specific value.", |ui| {
+            let mut custom_args = launch.args.is_some();
+            if ui.checkbox(&mut custom_args, "Use project launch arguments").changed() {
+                launch.args = custom_args.then(|| global_args.clone());
+            }
+            if let Some(args) = &mut launch.args {
+                note(ui, "Arguments for the game itself go after --.");
+                let width = ui.available_width();
+                theme::field(ui, args, "--strict -- -title-argument", width, None);
+            } else if !global_args.trim().is_empty() {
+                wrapped(ui, global_args, theme::FAINT);
+            }
+            ui.add_space(10.0);
+            let mut custom_switches = launch.switches.is_some();
+            if ui.checkbox(&mut custom_switches, "Use project launch switches").changed() {
+                launch.switches = custom_switches.then(|| global_switches.clone());
+            }
+            if let Some(switches) = &mut launch.switches {
+                note(ui, "Enter one VICTORY_NAME=value switch per line.");
+                let width = ui.available_width();
+                ui.add(egui::TextEdit::multiline(switches)
+                    .font(theme::mono(12.5))
+                    .hint_text("VICTORY_NAME=value")
+                    .desired_rows(4)
+                    .desired_width((width - 28.0).max(0.0))
+                    .margin(Margin::symmetric(14.0, 10.0)));
+            }
+        });
+    }
+
+    fn project_notes(&mut self, ui: &mut Ui, project: &Project) {
+        let launch = self.saved.project_launch.entry(project.repo.to_ascii_lowercase()).or_default();
+        section(ui, "Profile notes", None, "Saved locally for this project.", |ui| {
+            ui.add(egui::TextEdit::multiline(&mut launch.notes)
+                .hint_text("Record performance, glitches, or settings to try…")
+                .desired_rows(7)
+                .desired_width((ui.available_width() - 28.0).max(0.0))
+                .margin(Margin::symmetric(14.0, 10.0)));
+        });
     }
 
     /// What the launcher is doing, and its log.
@@ -809,31 +973,13 @@ impl App {
             Some("Beta"),
             "These options may not work with every project or on older PCs. If a game will not start or looks wrong, choose Best quality and turn the fixes off.",
             |ui| {
-                let current = self.mode_index();
-                ui.horizontal(|ui| {
-                    let names: Vec<&str> = MODES.iter().map(|m| m.0).collect();
-                    if let Some(i) = theme::segmented(ui, "mode", &names, current, None) {
-                        self.saved.series_s = MODES[i].1;
-                        self.saved.render_scale = MODES[i].2;
-                    }
-                    ui.add_space(6.0);
-                    let what = match self.mode_index() {
-                        Some(i) => MODES[i].3.to_string(),
-                        None => format!("Your own render scale: {:.0}%.", self.saved.render_scale * 100.0),
-                    };
-                    note(ui, &what);
-                });
-                ui.add_space(20.0);
-                theme::toggle(ui, &mut self.saved.fix_8gb, "8 GB graphics card fix", "Smaller textures, and grey in place of missing ones.");
-                ui.add_space(14.0);
-                theme::toggle(ui, &mut self.saved.bright_shadows, "Brighter shadows", "A steady ambient light where ray tracing does not run.");
-                ui.add_space(14.0);
-                theme::toggle(
-                    ui,
-                    &mut self.saved.fullscreen,
-                    "Borderless fullscreen",
-                    "The game's window covers its whole monitor, with no frame.",
-                );
+                let mut graphics = self.saved.default_graphics();
+                graphics_controls(ui, &mut graphics);
+                self.saved.series_s = graphics.series_s;
+                self.saved.render_scale = graphics.render_scale;
+                self.saved.fix_8gb = graphics.fix_8gb;
+                self.saved.bright_shadows = graphics.bright_shadows;
+                self.saved.fullscreen = graphics.fullscreen;
             },
         );
     }
@@ -859,7 +1005,7 @@ impl App {
                     "Slow: about 20 minutes on 16 threads, hours after a translator update. They belong to this graphics card and driver.",
                 );
                 ui.add_space(20.0);
-                ui.label(RichText::new("Launch arguments").font(theme::strong(14.0)).color(theme::WHITE));
+                ui.label(RichText::new("Default launch arguments").font(theme::strong(14.0)).color(theme::WHITE));
                 note(ui, "Added to victory run, for example --strict. Arguments for the game itself go after --.");
                 ui.add_space(6.0);
                 let w = ui.available_width();
@@ -913,7 +1059,7 @@ impl App {
     }
 
     fn switches_card(&mut self, ui: &mut Ui) {
-        section(ui, "Launch switches", None, "For experts: extra switches for the game, one per line, as VICTORY_NAME=value.", |ui| {
+        section(ui, "Default launch switches", None, "Used by projects that inherit these switches. Enter one VICTORY_NAME=value per line.", |ui| {
             let w = ui.available_width();
             ui.add(
                 egui::TextEdit::multiline(&mut self.saved.extra_env)
@@ -928,12 +1074,59 @@ impl App {
     }
 
     fn about_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
+        self.updater.poll();
+        use crate::updater::{State, RELEASES};
+        section(ui, "Launcher updates", None, concat!("Mandyhub ", env!("CARGO_PKG_VERSION")), |ui| {
+            match &self.updater.state {
+                State::Idle => {}
+                State::Checking => note(ui, "Checking GitHub for updates…"),
+                State::Current => note(ui, "You’re on the latest release."),
+                State::Available(release) => note(ui, &format!("{} is available.", release.tag_name)),
+                State::Downloading => note(ui, "Downloading and verifying the update…"),
+                State::Downloaded(path) => {
+                    wrapped(ui, "Update ready. Close this launcher, then open Mandyhub.exe from the download folder.", theme::BLUSH);
+                    if theme::button(ui, Look::Secondary, Some(glyph::FOLDER), "Open download folder").clicked() {
+                        if let Some(folder) = path.parent() {
+                            let _ = std::process::Command::new("explorer").arg(folder).spawn();
+                        }
+                    }
+                }
+                State::Failed(error) => wrapped(ui, error, theme::BAD),
+            }
+            ui.horizontal_wrapped(|ui| {
+                match self.updater.state {
+                    State::Available(_) => {
+                        if theme::button(ui, Look::Primary, Some(glyph::DOWNLOAD), "Download update").clicked() {
+                            self.updater.download(ctx);
+                        }
+                    }
+                    State::Checking | State::Downloading => {}
+                    _ => {
+                        if theme::button(ui, Look::Secondary, Some(glyph::SYNC), "Check for updates").clicked() {
+                            self.updater.check(ctx);
+                        }
+                    }
+                }
+                if theme::button(ui, Look::Ghost, Some(glyph::OPEN), "Release notes").clicked() {
+                    ctx.open_url(egui::OpenUrl::new_tab(RELEASES));
+                }
+            });
+        });
+        ui.add_space(14.0);
         section(ui, "About Mandyhub", None, "", |ui| {
             wrapped(
                 ui,
                 "Mandyhub by Zettrox. The project list comes from PortWatch. The projects are their authors' work, built on VIctory by Marvisak and its contributors.",
                 theme::BLUSH,
             );
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to("ellion369", "https://github.com/ellion369");
+                note(ui, "Launcher redesign");
+            });
+            ui.horizontal_wrapped(|ui| {
+                ui.hyperlink_to("TheGameOnAddict", "https://github.com/TheGameOnAddict");
+                note(ui, "Save picker, checkpoints, project settings, notes, build tracking, and compatibility improvements");
+            });
             wrapped(ui, "No game files are included or downloaded: you need your own copy of the game.", theme::FAINT);
             wrapped(ui, "Display type: Josefin Sans and Big Shoulders Display, under the SIL Open Font License.", theme::FAINT);
             ui.add_space(10.0);
@@ -1125,14 +1318,8 @@ impl App {
         }
     }
 
-    fn mode_index(&self) -> Option<usize> {
-        MODES.iter().position(|(_, series_s, scale, _)| {
-            self.saved.series_s == *series_s && (!*series_s || (self.saved.render_scale - scale).abs() < 0.01)
-        })
-    }
-
     fn mode_name(&self) -> String {
-        match self.mode_index() {
+        match graphics_mode(self.saved.default_graphics()) {
             Some(i) => MODES[i].0.to_string(),
             None => format!("{:.0}%", self.saved.render_scale * 100.0),
         }
