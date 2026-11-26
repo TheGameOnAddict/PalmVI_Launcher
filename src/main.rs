@@ -165,7 +165,44 @@ fn target_dir(repo: &str) -> PathBuf {
     workspace().join("target").join(slug(repo))
 }
 fn built_exe(repo: &str) -> PathBuf {
-    target_dir(repo).join("release").join("victory.exe")
+    let dir = repo_dir(repo);
+    let profile = detect_build_profile(&dir);
+    target_dir(repo).join(profile).join("victory.exe")
+}
+
+/// Checks a cloned repo's Cargo.toml for a custom build profile (e.g. `diag`).
+fn detect_build_profile(repo_dir: &Path) -> &'static str {
+    let cargo_toml = repo_dir.join("Cargo.toml");
+    if let Ok(text) = std::fs::read_to_string(&cargo_toml) {
+        if text.contains("[profile.diag]") {
+            return "diag";
+        }
+    }
+    "release"
+}
+
+/// Reads VICTORY_* environment variables from a project's scripts/play.ps1.
+fn detect_launch_env(repo_dir: &Path) -> Vec<(String, String)> {
+    let script = repo_dir.join("scripts").join("play.ps1");
+    let Ok(text) = std::fs::read_to_string(&script) else { return Vec::new() };
+    let mut vars = Vec::new();
+    // Parse PowerShell hashtable lines like: VICTORY_FOO = '1'; VICTORY_BAR = '2'
+    // They appear inside $settings = @{ ... } and in conditional blocks.
+    for line in text.lines() {
+        let line = line.trim().trim_end_matches(';').trim();
+        // Match lines containing VICTORY_ assignments with single-quoted values.
+        for part in line.split(';') {
+            let part = part.trim();
+            if let Some((k, v)) = part.split_once('=') {
+                let k = k.trim().trim_start_matches("$settings.");
+                let v = v.trim().trim_matches('\'').trim_matches('"');
+                if k.starts_with("VICTORY_") && !k.contains(' ') {
+                    vars.push((k.to_string(), v.to_string()));
+                }
+            }
+        }
+    }
+    vars
 }
 /// The commit an installed build was made from, written after a build.
 fn built_file(repo: &str) -> PathBuf {
@@ -660,14 +697,16 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<()
     }
     stage(job, ctx, "Building (the first time takes several minutes)");
     let target = target_dir(&p.repo);
-    run(
-        job,
-        ctx,
-        tools::cargo()
-            .args(["build", "--release", "-p", "victory", "--target-dir"])
-            .arg(&target)
-            .current_dir(&dir),
-    )?;
+    let profile = detect_build_profile(&dir);
+    let has_lockfile = dir.join("Cargo.lock").is_file();
+    let mut cargo = tools::cargo();
+    cargo.args(["build", "--profile", profile, "-p", "victory", "--target-dir"]);
+    cargo.arg(&target);
+    if has_lockfile {
+        cargo.arg("--locked");
+    }
+    cargo.current_dir(&dir);
+    run(job, ctx, &mut cargo)?;
     if !built_exe(&p.repo).is_file() {
         return Err(format!("the build made no {}", built_exe(&p.repo).display()));
     }
@@ -716,6 +755,12 @@ fn play(
     let ws = workspace();
     let mut c = Command::new(&exe);
     c.arg("run").arg(game_dir.join(EXE_NAME)).arg("--execute");
+    // The project's own env vars (from its scripts/play.ps1) go first;
+    // the player's switches and extra lines can override them.
+    let dir = repo_dir(&p.repo);
+    for (k, v) in detect_launch_env(&dir) {
+        c.env(&k, &v);
+    }
     if series_s {
         c.args(["--console", "series-s"]);
         c.env("VICTORY_OWN_UPSCALER", "1");
