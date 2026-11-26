@@ -73,6 +73,8 @@ pub mod glyph {
     pub const SETTINGS: char = '\u{E713}';
     pub const SYNC: char = '\u{E895}';
     pub const WARNING: char = '\u{E7BA}';
+    pub const STOP: char = '\u{E71A}';
+    pub const WARM: char = '\u{E945}';
 }
 
 /// Whether an icon font was found (without one, controls show words only).

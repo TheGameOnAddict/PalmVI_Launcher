@@ -74,6 +74,8 @@ fn short_stage(stage: &str) -> &'static str {
         "Playing"
     } else if stage.starts_with("Uninstall") {
         "Uninstalling"
+    } else if stage.starts_with("Warming") {
+        "Warming up"
     } else {
         "Starting"
     }
@@ -494,6 +496,8 @@ impl App {
                 note(ui, "Close the running game first.");
             } else if running {
                 note(ui, &format!("Waiting for {} to finish.", other.as_deref().unwrap_or("the current job")));
+            } else if installed && self.files_ok() && self.saved.warm_before_play {
+                note(ui, "Warms up the shaders first, then starts your installed build with your own game files.");
             } else if installed && self.files_ok() {
                 note(ui, "Starts your installed build with your own game files.");
             } else if installed {
@@ -529,6 +533,11 @@ impl App {
                     ui.add_space(6.0);
                     if theme::small(ui, Look::Ghost, Some(glyph::SYNC), "Check for updates", !st.checking).clicked() {
                         self.check_repo(ctx, p);
+                    }
+                    let warm = theme::small(ui, Look::Ghost, Some(glyph::WARM), "Warm up shaders", !running && self.files_ok())
+                        .on_hover_text("Translate the game's shaders into this project's cache now, so it does not stop to translate them while you play.");
+                    if warm.clicked() {
+                        self.start(ctx, p.clone(), Kind::Warm);
                     }
                     if theme::small(ui, Look::Ghost, Some(glyph::REPAIR), "Reinstall", !running).clicked() {
                         self.start(ctx, p.clone(), Kind::Install);
@@ -633,20 +642,23 @@ impl App {
 
     /// What the launcher is doing, and its log.
     fn activity(&mut self, ui: &mut Ui) {
-        let (running, failed, stage, has_log) = {
+        let (running, failed, stage, has_log, stoppable) = {
             let j = self.job.lock().unwrap();
-            (j.running, j.failed, j.stage.clone(), !j.log.is_empty())
+            (j.running, j.failed, j.stage.clone(), !j.log.is_empty(), j.running && j.stoppable)
         };
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
             theme::caps(ui, "Activity", 11.5, theme::LILAC);
-            if has_log {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                if has_log {
                     let label = if self.show_log { "Hide log" } else { "Show log" };
                     if theme::small(ui, Look::Ghost, None, label, true).clicked() {
                         self.show_log = !self.show_log;
                     }
-                });
-            }
+                }
+                if stoppable && theme::small(ui, Look::Danger, Some(glyph::STOP), "Stop", true).clicked() {
+                    self.stop_job();
+                }
+            });
         });
         ui.horizontal(|ui| {
             if running && stage != "Playing" {
@@ -709,6 +721,8 @@ impl App {
                 self.game_files_card(ui, ctx);
                 ui.add_space(16.0);
                 self.graphics_card(ui);
+                ui.add_space(16.0);
+                self.launch_card(ui);
                 ui.add_space(16.0);
                 self.install_folder_card(ui);
                 ui.add_space(16.0);
@@ -813,6 +827,36 @@ impl App {
                     "Borderless fullscreen",
                     "The game's window covers its whole monitor, with no frame.",
                 );
+            },
+        );
+    }
+
+    fn launch_card(&mut self, ui: &mut Ui) {
+        section(
+            ui,
+            "Shaders and launch",
+            None,
+            "VIctory can translate the game's shaders into its cache before you play, so the game does not stop to translate them on the way. Each project keeps its own cache.",
+            |ui| {
+                theme::toggle(
+                    ui,
+                    &mut self.saved.warm_before_play,
+                    "Warm up shaders before playing",
+                    "Runs the warm-up each time you press Play. The first one takes minutes and about 1.3 GB; you can also run it once from a project's page.",
+                );
+                ui.add_space(14.0);
+                theme::toggle(
+                    ui,
+                    &mut self.saved.warm_pipelines,
+                    "Also build the GPU pipelines",
+                    "Slow: about 20 minutes on 16 threads, hours after a translator update. They belong to this graphics card and driver.",
+                );
+                ui.add_space(20.0);
+                ui.label(RichText::new("Launch arguments").font(theme::strong(14.0)).color(theme::WHITE));
+                note(ui, "Added to victory run, for example --strict. Arguments for the game itself go after --.");
+                ui.add_space(6.0);
+                let w = ui.available_width();
+                theme::field(ui, &mut self.saved.launch_args, "--strict -- -title-argument", w, None);
             },
         );
     }
@@ -1012,6 +1056,21 @@ impl App {
             if close || dismissed {
                 self.pending_move = None;
             }
+        }
+    }
+
+    /// Ends the running warm-up (its process and the workers it started).
+    fn stop_job(&self) {
+        let pid = {
+            let mut j = self.job.lock().unwrap();
+            j.stopped = true;
+            j.pid
+        };
+        if let Some(pid) = pid {
+            let mut c = std::process::Command::new("taskkill");
+            c.args(["/PID", &pid.to_string(), "/T", "/F"]);
+            crate::hide_window(&mut c);
+            let _ = c.spawn();
         }
     }
 

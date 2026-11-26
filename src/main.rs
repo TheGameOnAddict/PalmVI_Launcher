@@ -77,6 +77,12 @@ struct Saved {
     render_scale: f32,
     extra_env: String,
     gpu_filter: usize,
+    /// Translate the shaders into the cache (`victory translate --cache`) before each Play.
+    warm_before_play: bool,
+    /// With the warm-up, also build the GPU pipelines (`--pipelines`; can take hours).
+    warm_pipelines: bool,
+    /// Extra arguments for `victory run`; the game's own go after `--`.
+    launch_args: String,
 }
 
 /// Shared state of the background job (download, build, play).
@@ -88,6 +94,69 @@ struct Job {
     stage: String,
     log: Vec<String>,
     failed: bool,
+    /// The process running now, while the player may stop it (a warm-up).
+    pid: Option<u32>,
+    stoppable: bool,
+    /// The player pressed Stop.
+    stopped: bool,
+}
+
+/// How a project is started, read from the settings when its job starts.
+/// The warm-up and Play share it, so the warm-up fills the cache Play reads.
+#[derive(Clone)]
+struct Launch {
+    game_dir: PathBuf,
+    series_s: bool,
+    scale: f32,
+    /// `VICTORY_*` lines: the player's switches and the graphics fixes.
+    extra: String,
+    fullscreen: bool,
+    warm_first: bool,
+    pipelines: bool,
+    args: Vec<String>,
+}
+
+/// The game files `victory translate --cache` reads shaders from (those that exist are passed).
+const WARM_FILES: &[&str] = &["shaders.rpf", EXE_NAME, "XboxBvhBuilder.dll", "amd_fidelityfx_upscaler_xbox.dll"];
+
+/// Launch arguments as the player typed them: split at spaces, "double quotes" keeping one together.
+fn split_args(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted, mut any) = (Vec::new(), String::new(), false, false);
+    for ch in s.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                any = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if any {
+                    out.push(std::mem::take(&mut cur));
+                    any = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                any = true;
+            }
+        }
+    }
+    if any {
+        out.push(cur);
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_args;
+
+    #[test]
+    fn launch_arguments_split_at_spaces_and_keep_quotes_together() {
+        assert_eq!(split_args(""), Vec::<String>::new());
+        assert_eq!(split_args("  --strict   "), ["--strict"]);
+        assert_eq!(split_args("--strict -- -windowed"), ["--strict", "--", "-windowed"]);
+        assert_eq!(split_args(r#"-- -name "two words" """#), ["--", "-name", "two words", ""]);
+    }
 }
 
 struct App {
@@ -130,6 +199,8 @@ struct App {
     modal_was_open: bool,
     /// Whether the window's title bar was made dark.
     title_bar_done: bool,
+    /// Whether the window's remembered size was checked at start.
+    size_checked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -167,6 +238,8 @@ enum Kind {
     Install,
     Play,
     Uninstall,
+    /// Shaders into the cache ahead of time, without playing.
+    Warm,
 }
 
 fn slug(repo: &str) -> String {
@@ -511,6 +584,7 @@ impl App {
             modal_at: 0.0,
             modal_was_open: false,
             title_bar_done: false,
+            size_checked: false,
         };
         if !app.saved.defaults_set {
             app.saved.defaults_set = true;
@@ -636,10 +710,6 @@ impl App {
         }
         // An install over an installed project is an update.
         let updating = kind == Kind::Install && built_exe(&p.repo).is_file();
-        let game_dir = PathBuf::from(&self.saved.game_dir);
-        let series_s = self.saved.series_s;
-        let fullscreen = self.saved.fullscreen;
-        let scale = self.saved.render_scale;
         let mut extra = self.saved.extra_env.clone();
         if self.saved.fix_8gb {
             extra.push_str("\nVICTORY_TEXTURE_DROP_MIPS=2\nVICTORY_NULL_COLOR=grey");
@@ -647,23 +717,38 @@ impl App {
         if self.saved.bright_shadows {
             extra.push_str("\nVICTORY_AMBIENT=0.6");
         }
+        let launch = Launch {
+            game_dir: PathBuf::from(&self.saved.game_dir),
+            series_s: self.saved.series_s,
+            scale: self.saved.render_scale,
+            extra,
+            fullscreen: self.saved.fullscreen,
+            warm_first: self.saved.warm_before_play,
+            pipelines: self.saved.warm_pipelines,
+            args: split_args(&self.saved.launch_args),
+        };
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
             let r = match kind {
                 Kind::Install => install(&job, &ctx, &p),
-                Kind::Play => play(&job, &ctx, &p, &game_dir, series_s, scale, &extra, fullscreen),
+                Kind::Play => play(&job, &ctx, &p, &launch),
                 Kind::Uninstall => uninstall(&job, &ctx, &p),
+                Kind::Warm => warm(&job, &ctx, &p, &launch),
             };
             {
                 let mut j = job.lock().unwrap();
                 j.running = false;
+                j.pid = None;
+                j.stoppable = false;
                 match r {
+                    _ if j.stopped => j.stage = "Stopped".into(),
                     Ok(()) => {
                         j.stage = match kind {
                             Kind::Install if updating => "Updated: ready to play".into(),
                             Kind::Install => "Installed: ready to play".into(),
                             Kind::Play => "Game closed".into(),
                             Kind::Uninstall => "Uninstalled".into(),
+                            Kind::Warm => "Shaders warmed up: ready to play".into(),
                         }
                     }
                     Err(e) => {
@@ -671,13 +756,14 @@ impl App {
                         j.stage = match kind {
                             Kind::Install if updating => "Update failed: the old version is still installed (see the log)".into(),
                             Kind::Install => "Install failed (see the log)".into(),
+                            Kind::Warm => "Warm-up failed (see the log)".into(),
                             _ => "Failed".into(),
                         };
                         j.log.push(format!("ERROR: {e}"));
                     }
                 }
             }
-            if kind != Kind::Play {
+            if matches!(kind, Kind::Install | Kind::Uninstall) {
                 let st = repo_state(&p);
                 repos.lock().unwrap().insert(p.repo.clone(), st);
             }
@@ -757,41 +843,33 @@ fn uninstall(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<
     Ok(())
 }
 
-/// Starts the installed build of `p`.
-fn play(
-    job: &Arc<Mutex<Job>>,
-    ctx: &egui::Context,
-    p: &Project,
-    game_dir: &Path,
-    series_s: bool,
-    scale: f32,
-    extra: &str,
-    fullscreen: bool,
-) -> Result<(), String> {
+/// The victory.exe `p` runs with: its build, or a build already on this PC.
+fn project_exe(p: &Project) -> Result<PathBuf, String> {
     let exe = p.local_exe.as_ref().map(PathBuf::from).unwrap_or_else(|| built_exe(&p.repo));
-    if !exe.is_file() {
-        return Err("this project is not installed yet: press Install".into());
+    if exe.is_file() {
+        Ok(exe)
+    } else {
+        Err("this project is not installed yet: press Install".into())
     }
-    stage(job, ctx, "Playing");
-    let ws = workspace();
-    let mut c = Command::new(&exe);
-    c.arg("run").arg(game_dir.join(EXE_NAME)).arg("--execute");
-    // The project's own env vars (from its scripts/play.ps1) go first;
-    // the player's switches and extra lines can override them.
-    let dir = repo_dir(&p.repo);
-    for (k, v) in detect_launch_env(&dir) {
+}
+
+/// The environment victory.exe runs with, the same for the warm-up and for
+/// Play: the project's own env vars (from its scripts/play.ps1) first, then
+/// the mode, its data and cache folders, and the player's switches.
+fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
+    for (k, v) in detect_launch_env(&repo_dir(&p.repo)) {
         c.env(&k, &v);
     }
-    if series_s {
-        c.args(["--console", "series-s"]);
+    if l.series_s {
         c.env("VICTORY_OWN_UPSCALER", "1");
-        c.env("VICTORY_RENDER_SCALE", format!("{scale:.2}"));
+        c.env("VICTORY_RENDER_SCALE", format!("{:.2}", l.scale));
     }
+    let ws = workspace();
     let data = ws.join("data").join(slug(&p.repo));
     let _ = std::fs::create_dir_all(&data);
     c.env("VICTORY_DATA_DIR", &data);
     c.env("VICTORY_CACHE_DIR", ws.join("cache").join(slug(&p.repo)));
-    for line in extra.lines() {
+    for line in l.extra.lines() {
         if let Some((k, v)) = line.split_once('=') {
             let k = k.trim();
             if k.starts_with("VICTORY_") {
@@ -799,6 +877,65 @@ fn play(
             }
         }
     }
+}
+
+/// Translates the game's shaders into `p`'s shader cache ahead of time
+/// (`victory translate --cache`), so a run does not stop to translate them
+/// while it plays; with `pipelines`, then builds the GPU pipelines too. The
+/// player can stop it.
+fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> Result<(), String> {
+    let exe = project_exe(p)?;
+    let files: Vec<PathBuf> = WARM_FILES.iter().map(|f| l.game_dir.join(f)).filter(|f| f.is_file()).collect();
+    if files.is_empty() {
+        return Err("the game files were not found: choose their folder in Settings".into());
+    }
+    stage(
+        job,
+        ctx,
+        if l.pipelines {
+            "Warming up shaders and pipelines (this can take hours)"
+        } else {
+            "Warming up shaders (the first time takes minutes)"
+        },
+    );
+    let mut c = Command::new(&exe);
+    c.args(["translate", "--cache"]);
+    if l.pipelines {
+        c.arg("--pipelines");
+    }
+    c.args(&files);
+    victory_env(&mut c, p, l);
+    job.lock().unwrap().stoppable = true;
+    let r = run_with(job, ctx, &mut c, |pid| job.lock().unwrap().pid = Some(pid));
+    {
+        let mut j = job.lock().unwrap();
+        j.stoppable = false;
+        j.pid = None;
+    }
+    r.map_err(|e| format!("{e} (builds from before VIctory's `translate --cache` have no warm-up)"))
+}
+
+/// Starts the installed build of `p`, warming its shaders first when the player asked for that.
+fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> Result<(), String> {
+    let exe = project_exe(p)?;
+    if l.warm_first {
+        if let Err(e) = warm(job, ctx, p, l) {
+            if job.lock().unwrap().stopped {
+                return Err("stopped".into());
+            }
+            job.lock().unwrap().log.push(format!("Warm-up failed: {e}. Starting the game anyway."));
+        }
+    }
+    stage(job, ctx, "Playing");
+    let mut c = Command::new(&exe);
+    c.arg("run").arg(l.game_dir.join(EXE_NAME)).arg("--execute");
+    if l.series_s {
+        c.args(["--console", "series-s"]);
+    }
+    // The player's own: more `run` flags, and after `--` the game's.
+    c.args(&l.args);
+    victory_env(&mut c, p, l);
+    let fullscreen = l.fullscreen;
     run_with(job, ctx, &mut c, |pid| {
         if fullscreen {
             fullscreen::keep_borderless(pid);
@@ -849,6 +986,16 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if !self.title_bar_done {
             self.title_bar_done = fullscreen::dark_title_bar(std::process::id(), theme::BG, theme::WHITE);
+        }
+        // A size remembered from a minimized window can come back tiny: then the normal size.
+        if !self.size_checked {
+            let (rect, minimized) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().minimized));
+            if let Some(r) = rect {
+                if minimized != Some(true) && (r.width() < 960.0 || r.height() < 620.0) {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(1280.0, 800.0)));
+                }
+                self.size_checked = true;
+            }
         }
         self.draw(ctx);
     }
