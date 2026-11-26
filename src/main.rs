@@ -94,6 +94,8 @@ struct Saved {
 #[derive(Default)]
 struct Job {
     running: bool,
+    /// The project the job works on.
+    repo: Option<String>,
     stage: String,
     log: Vec<String>,
     failed: bool,
@@ -551,9 +553,24 @@ impl App {
 
     /// A newer version online than the one installed, and not put off.
     fn update_for(&self, p: &Project) -> Option<String> {
-        let st = self.state_of(&p.repo)?;
-        let remote = st.remote?;
-        let newer = st.installed && st.built.as_deref() != Some(remote.as_str());
+        if p.local_exe.is_some() {
+            return None;
+        }
+        // Not while this project is being installed or updated.
+        {
+            let j = self.job.lock().unwrap();
+            if j.running && j.repo.as_deref() == Some(p.repo.as_str()) {
+                return None;
+            }
+        }
+        let remote = self.state_of(&p.repo)?.remote?;
+        // What is installed now, from disk: a check that started before the
+        // last update finished must not bring the old version back.
+        if !built_exe(&p.repo).is_file() {
+            return None;
+        }
+        let built = std::fs::read_to_string(built_file(&p.repo)).ok().map(|s| s.trim().to_string());
+        let newer = built.as_deref() != Some(remote.as_str());
         let later = self.saved.later.iter().any(|(r, c)| r == &p.repo && c == &remote);
         (newer && !later).then_some(remote)
     }
@@ -565,8 +582,10 @@ impl App {
             if j.running {
                 return;
             }
-            *j = Job { running: true, stage: "Starting".into(), ..Default::default() };
+            *j = Job { running: true, stage: "Starting".into(), repo: Some(p.repo.clone()), ..Default::default() };
         }
+        // An install over an installed project is an update.
+        let updating = kind == Kind::Install && built_exe(&p.repo).is_file();
         let game_dir = PathBuf::from(&self.saved.game_dir);
         let series_s = self.saved.series_s;
         let fullscreen = self.saved.fullscreen;
@@ -591,6 +610,7 @@ impl App {
                 match r {
                     Ok(()) => {
                         j.stage = match kind {
+                            Kind::Install if updating => "Updated: ready to play".into(),
                             Kind::Install => "Installed: ready to play".into(),
                             Kind::Play => "Game closed".into(),
                             Kind::Uninstall => "Uninstalled".into(),
@@ -598,7 +618,11 @@ impl App {
                     }
                     Err(e) => {
                         j.failed = true;
-                        j.stage = "Failed".into();
+                        j.stage = match kind {
+                            Kind::Install if updating => "Update failed: the old version is still installed (see the log)".into(),
+                            Kind::Install => "Install failed (see the log)".into(),
+                            _ => "Failed".into(),
+                        };
                         j.log.push(format!("ERROR: {e}"));
                     }
                 }
