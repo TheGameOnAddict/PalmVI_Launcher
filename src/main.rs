@@ -14,6 +14,7 @@ mod slides;
 mod theme;
 mod tools;
 mod ui;
+mod saves;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -99,6 +100,7 @@ struct App {
     tools: Option<tools::Tools>,
     /// The project an uninstall is being confirmed for.
     confirm_uninstall: Option<String>,
+    save_picker: Option<ui::SavePicker>,
     /// A new install folder waiting for "move the projects there?" (from, to).
     pending_move: Option<(PathBuf, PathBuf)>,
     /// The folder the files were checked in was empty.
@@ -162,10 +164,10 @@ struct RepoState {
 }
 
 /// What the background job does.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Kind {
     Install,
-    Play,
+    Play(saves::LaunchSave),
     Uninstall,
 }
 
@@ -336,7 +338,7 @@ fn set_install_dir(dir: &str) {
 }
 
 /// The parts of an install folder that belong to projects.
-const PROJECT_PARTS: &[&str] = &["repos", "target", "cache", "data"];
+const PROJECT_PARTS: &[&str] = &["repos", "target", "cache", "data", "checkpoints"];
 
 /// Whether `dir` holds any installed project.
 fn has_projects(dir: &Path) -> bool {
@@ -494,6 +496,7 @@ impl App {
             files_for: String::new(),
             tools: None,
             confirm_uninstall: None,
+            save_picker: None,
             pending_move: None,
             empty: false,
             finding: Arc::new(Mutex::new(None)),
@@ -649,9 +652,9 @@ impl App {
         }
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
-            let r = match kind {
+            let r = match &kind {
                 Kind::Install => install(&job, &ctx, &p),
-                Kind::Play => play(&job, &ctx, &p, &game_dir, series_s, scale, &extra, fullscreen),
+                Kind::Play(choice) => play(&job, &ctx, &p, &game_dir, series_s, scale, &extra, fullscreen, choice),
                 Kind::Uninstall => uninstall(&job, &ctx, &p),
             };
             {
@@ -662,7 +665,7 @@ impl App {
                         j.stage = match kind {
                             Kind::Install if updating => "Updated: ready to play".into(),
                             Kind::Install => "Installed: ready to play".into(),
-                            Kind::Play => "Game closed".into(),
+                            Kind::Play(_) => "Game closed".into(),
                             Kind::Uninstall => "Uninstalled".into(),
                         }
                     }
@@ -677,7 +680,7 @@ impl App {
                     }
                 }
             }
-            if kind != Kind::Play {
+            if !matches!(kind, Kind::Play(_)) {
                 let st = repo_state(&p);
                 repos.lock().unwrap().insert(p.repo.clone(), st);
             }
@@ -767,6 +770,7 @@ fn play(
     scale: f32,
     extra: &str,
     fullscreen: bool,
+    choice: &saves::LaunchSave,
 ) -> Result<(), String> {
     let exe = p.local_exe.as_ref().map(PathBuf::from).unwrap_or_else(|| built_exe(&p.repo));
     if !exe.is_file() {
@@ -787,8 +791,9 @@ fn play(
         c.env("VICTORY_OWN_UPSCALER", "1");
         c.env("VICTORY_RENDER_SCALE", format!("{scale:.2}"));
     }
-    let data = ws.join("data").join(slug(&p.repo));
-    let _ = std::fs::create_dir_all(&data);
+    let project_data = ws.join("data").join(slug(&p.repo));
+    let data = saves::prepare(&project_data, choice).map_err(|error| format!("Could not prepare saves: {error}"))?;
+    std::fs::create_dir_all(&data).map_err(|error| format!("Could not create the save folder: {error}"))?;
     c.env("VICTORY_DATA_DIR", &data);
     c.env("VICTORY_CACHE_DIR", ws.join("cache").join(slug(&p.repo)));
     for line in extra.lines() {
@@ -798,6 +803,9 @@ fn play(
                 c.env(k, v.trim());
             }
         }
+    }
+    if data != project_data {
+        c.env("VICTORY_DATA_DIR", &data);
     }
     run_with(job, ctx, &mut c, |pid| {
         if fullscreen {

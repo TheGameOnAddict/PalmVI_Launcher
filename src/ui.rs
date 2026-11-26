@@ -9,6 +9,9 @@ use crate::{AddRepo, App, Kind, Project, RepoState, View};
 use eframe::egui::{self, vec2, Align, Color32, Frame, Label, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::time::Duration;
 
+mod save_picker;
+pub(crate) use save_picker::SavePicker;
+
 /// The graphics modes: name, Series S profile, render scale, what it does.
 const MODES: [(&str, bool, f32, &str); 3] = [
     ("Fast", true, 0.5, "Renders at half resolution and scales up."),
@@ -465,7 +468,11 @@ impl App {
             };
             let enabled = !running && if installed { self.files_ok() } else { tools_ok };
             if theme::button_ex(ui, Look::Primary, Size::Large, icon, label, enabled, this_job).clicked() {
-                self.start(ctx, p.clone(), if installed { Kind::Play } else { Kind::Install });
+                if installed {
+                    self.save_picker = Some(SavePicker::new(p.clone()));
+                } else {
+                    self.start(ctx, p.clone(), Kind::Install);
+                }
             }
             if theme::button_ex(ui, Look::Secondary, Size::Large, Some(glyph::OPEN), "Open on GitHub", true, false)
                 .on_hover_text(&url)
@@ -895,12 +902,22 @@ impl App {
     /// The open dialog, if any: add a repo, uninstall, or move the install folder.
     fn dialogs(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        let open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some();
+        let open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some() || self.save_picker.is_some();
         if open && !self.modal_was_open {
             self.modal_at = now;
         }
         self.modal_was_open = open;
         let t0 = self.modal_at;
+
+        if let Some(mut picker) = self.save_picker.take() {
+            let running = self.job.lock().unwrap().running;
+            let (action, dismissed) = picker.show(ctx, t0, !running && self.files_ok());
+            match action {
+                save_picker::Action::Launch(choice) if !dismissed => self.start(ctx, picker.project, Kind::Play(choice)),
+                save_picker::Action::Keep if !dismissed => self.save_picker = Some(picker),
+                _ => {}
+            }
+        }
 
         if let Some(mut add) = self.add_repo.take() {
             let mut keep = true;
