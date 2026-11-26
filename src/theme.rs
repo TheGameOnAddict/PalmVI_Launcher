@@ -1,4 +1,4 @@
-//! Mandyhub's look in one place, after GTA VI's own site: a deep navy night,
+//! Mandyhub's Newer Retail Games style uses a deep navy night,
 //! a pastel sunset strip along the top, soft pink pill buttons with plum
 //! type, lavender spaced capitals for labels and pale blush for reading.
 //! Rockstar's typeface is theirs, so the look-alikes are free ones built into
