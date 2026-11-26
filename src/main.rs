@@ -1322,6 +1322,33 @@ fn victory_help(exe: &Path, subcommand: &str) -> Option<String> {
     output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Some forks open their pipeline bookkeeping files even before the first game run.
+fn prepare_pipeline_cache(command: &Command) -> Result<(), String> {
+    let Some(cache) = command.get_envs().find_map(|(key, value)| {
+        (key == "VICTORY_CACHE_DIR").then_some(value).flatten().filter(|path| !path.is_empty())
+    }) else {
+        return Ok(());
+    };
+    let cache = Path::new(cache);
+    let folder = command.get_current_dir().unwrap_or(Path::new(".")).join(cache).join("pipelines");
+    std::fs::create_dir_all(&folder)
+        .map_err(|error| format!("Could not create the pipeline cache folder {}: {error}", folder.display()))
+}
+
+#[cfg(test)]
+#[test]
+fn pipeline_warm_up_creates_the_configured_cache_on_first_use() {
+    let root = std::env::temp_dir().join(format!("mandyhub-pipeline-cache-{}", std::process::id()));
+    let mut command = Command::new("victory.exe");
+    command.current_dir(&root).env("VICTORY_CACHE_DIR", "custom cache");
+    prepare_pipeline_cache(&command).unwrap();
+    prepare_pipeline_cache(&command).unwrap();
+    assert!(root.join("custom cache").join("pipelines").is_dir());
+    std::fs::remove_dir(root.join("custom cache").join("pipelines")).unwrap();
+    std::fs::remove_dir(root.join("custom cache")).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
 /// Fills the same shader cache as Play, using the commands the installed fork exposes.
 fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> Result<(), String> {
     let exe = project_exe(p)?;
@@ -1366,6 +1393,9 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> 
     );
     for mut command in commands {
         victory_env(&mut command, p, l);
+        if command.get_args().next().is_some_and(|arg| arg == "warm") {
+            prepare_pipeline_cache(&command)?;
+        }
         job.lock().unwrap().stoppable = true;
         let result = run_with(job, ctx, &mut command, |pid| job.lock().unwrap().pid = Some(pid));
         let stopped = {
