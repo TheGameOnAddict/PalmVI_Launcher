@@ -2,15 +2,21 @@
 
 A community launcher for VIctory-based projects.
 
-[Download Mandyhub for Windows](https://github.com/TheGameOnAddict/mandyhub/releases/latest).
-In **Settings → Launcher updates**, check for a newer release and download it.
-Mandyhub checks the executable against GitHub’s SHA-256 checksum. When the
-download is ready, close the current launcher and open the downloaded copy.
+[Download Mandyhub for Windows](https://github.com/TheGameOnAddict/mandyhub-sinkfinger/releases/latest).
+Mandyhub checks for launcher updates on startup. Use **Update and restart** in
+**Settings → Launcher updates** to download the release, verify its SHA-256
+checksum, and reopen Mandyhub.
 
-**Play** opens the save picker. Continue a save, start fresh, copy an earlier
+For VIctory builds, **Play** opens the save picker. Continue a save, start fresh, copy an earlier
 save or a save from another build, or launch from a favorite checkpoint. To
 keep a reusable checkpoint, select a save, click **Add to favorites**, and name
 it. Each checkpoint launch uses a copy.
+
+Use **Import save ZIP** in the picker to add a downloaded save to Favorites.
+Select an existing save or checkpoint and choose **Export selected save** to
+make a shareable ZIP. Imports copy the save data into a new checkpoint.
+Choose **Delete selected save** to move a save out of the picker. Mandyhub
+keeps the files under `deleted-saves` in its install folder for recovery.
 
 ## Screenshots
 
@@ -21,12 +27,15 @@ These screenshots use example projects, saves, and performance figures.
 ![Mandyhub save picker with an example project selected](docs/screenshots/save-picker.png)
 
 - **Projects from PortWatch:** the list of public projects, live, with their reported frame rate, the graphics cards they were made for, and whether PortWatch has verified them.
-- **Custom repo links:** add any GitHub repo by its link.
+- **Custom Git links:** add a Rust project with a Git clone URL from GitHub, GitLab, Codeberg, Gitea, or a self-hosted server.
+- **Rust workspaces:** Mandyhub builds the workspace and starts its program from **Play**. Library-only workspaces show **Built**.
+- **ZIP builds:** choose **Import Repo/Zip → Import build ZIP…** to import a prebuilt Windows executable and its bundled files. Mandyhub uses its normal game launch flow for `victory.exe`.
+- **Activity log:** expand the log, select its text with Ctrl+A, copy it, or export it to a file.
 - **Install once, play many times:** a project is downloaded and built on your PC once and stays installed.
 - **Updates:** installed projects are checked for new versions at start and every 15 minutes; an update can be installed now or later.
 - **Install folder:** choose where projects are downloaded and built (a big drive is best); installed projects can be moved there.
 - **Uninstall:** removes a project's download, build and shader cache (saves stay).
-- **Game files check:** Play stays off until the folder with your own game files is chosen.
+- **Game files check:** choose your game files folder to enable Play on VIctory builds.
 - **Fullscreen:** optional borderless fullscreen for the game window.
 - **Project profiles:** keep graphics, launch arguments, environment switches, and private notes for each build.
 - **Build tracking:** see when you last ran a build and spot installs and updates you have yet to try.

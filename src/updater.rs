@@ -1,13 +1,13 @@
 use eframe::egui;
 use serde::Deserialize;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-pub const REPOSITORY: &str = "TheGameOnAddict/mandyhub";
-pub const RELEASES: &str = "https://github.com/TheGameOnAddict/mandyhub/releases";
+pub const REPOSITORY: &str = "TheGameOnAddict/mandyhub-sinkfinger";
+pub const RELEASES: &str = "https://github.com/TheGameOnAddict/mandyhub-sinkfinger/releases";
 const ASSET: &str = "Mandyhub.exe";
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -24,6 +24,12 @@ struct Asset {
     digest: Option<String>,
 }
 
+pub struct DownloadedUpdate {
+    pub path: PathBuf,
+    size: u64,
+    digest: String,
+}
+
 #[derive(Default)]
 pub enum State {
     #[default]
@@ -32,13 +38,15 @@ pub enum State {
     Current,
     Available(Release),
     Downloading,
-    Downloaded(PathBuf),
+    Downloaded(DownloadedUpdate),
     Failed(String),
 }
 
 #[derive(Default)]
 pub struct Updater {
     pub state: State,
+    pub restart_requested: bool,
+    pub restart_error: Option<String>,
     result: Option<Receiver<Result<State, String>>>,
 }
 
@@ -57,6 +65,8 @@ impl Updater {
     }
 
     pub fn check(&mut self, ctx: &egui::Context) {
+        self.restart_requested = false;
+        self.restart_error = None;
         self.start(ctx, State::Checking, check_release);
     }
 
@@ -64,6 +74,8 @@ impl Updater {
         let State::Available(release) = std::mem::take(&mut self.state) else {
             return;
         };
+        self.restart_requested = true;
+        self.restart_error = None;
         self.start(ctx, State::Downloading, move || {
             download_release(&release).map(State::Downloaded)
         });
@@ -127,7 +139,7 @@ fn check_release() -> Result<State, String> {
     }
 }
 
-fn download_release(release: &Release) -> Result<PathBuf, String> {
+fn download_release(release: &Release) -> Result<DownloadedUpdate, String> {
     let asset = release
         .assets
         .iter()
@@ -166,7 +178,68 @@ fn download_release(release: &Release) -> Result<PathBuf, String> {
         let _ = fs::remove_file(temporary);
         return Err(error.to_string());
     }
-    Ok(executable)
+    Ok(DownloadedUpdate {
+        path: executable,
+        size: asset.size,
+        digest: digest.to_owned(),
+    })
+}
+
+pub fn restart_with(update: &DownloadedUpdate) -> Result<(), String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let staged = executable.with_extension(format!("mandyhub-{}.tmp", std::process::id()));
+    let backup = executable.with_extension("mandyhub-previous.exe");
+    let source = fs::File::open(&update.path)
+        .map_err(|error| format!("Could not open the downloaded update: {error}"))?;
+    let mut bytes = Vec::new();
+    source
+        .take(update.size + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if !matches_asset(&bytes, update.size, &update.digest) {
+        return Err(
+            "The downloaded update changed on disk. Check for updates and download it again."
+                .into(),
+        );
+    }
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .map_err(|error| format!("Could not stage the update beside Mandyhub: {error}"))?;
+    let write_result = file.write_all(&bytes).and_then(|_| file.sync_all());
+    drop(file);
+    let result = (|| -> Result<(), String> {
+        write_result.map_err(|error| format!("Could not save the staged update: {error}"))?;
+        match fs::remove_file(&backup) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "Could not remove the previous update backup: {error}"
+                ))
+            }
+        }
+        fs::rename(&executable, &backup)
+            .map_err(|error| format!("Could not move the running launcher aside: {error}"))?;
+        let restore = |message: String| match fs::rename(&backup, &executable) {
+            Ok(()) => message,
+            Err(error) => format!(
+                "{message} Could not restore the previous version: {error}. Backup: {}",
+                backup.display()
+            ),
+        };
+        fs::rename(&staged, &executable)
+            .map_err(|error| restore(format!("Could not put the update in place: {error}")))?;
+        if let Err(error) = std::process::Command::new(&executable).spawn() {
+            return Err(restore(format!("Could not start the new version: {error}")));
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
 }
 
 fn matches_asset(bytes: &[u8], size: u64, sha256: &str) -> bool {

@@ -5,6 +5,51 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const SAVE_PATH: &str = "7952987A/saves";
 
+pub fn delete_save(workspace: &Path, source: &Path) -> io::Result<PathBuf> {
+    let workspace = workspace.canonicalize()?;
+    let source = source.canonicalize()?;
+    let relative = source.strip_prefix(&workspace).map_err(|_| {
+        io::Error::new(
+            ErrorKind::InvalidInput,
+            "The save is outside Mandyhub’s workspace.",
+        )
+    })?;
+    let save_folder = relative.starts_with("data") && relative.ends_with(SAVE_PATH);
+    let checkpoint = relative.parent() == Some(Path::new("checkpoints"))
+        && relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("Checkpoint - "));
+    if !(save_folder || checkpoint) || !source.is_dir() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "This is not a Mandyhub save folder.",
+        ));
+    }
+    let deleted = workspace.join("deleted-saves");
+    fs::create_dir_all(&deleted)?;
+    if deleted.canonicalize()? != deleted {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            "The deleted saves folder is redirected.",
+        ));
+    }
+    let id = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(io::Error::other)?
+        .as_nanos();
+    let backup = deleted.join(format!("{}-{id}", std::process::id()));
+    fs::create_dir(&backup)?;
+    let destination = backup.join(relative);
+    let result = fs::create_dir_all(destination.parent().unwrap())
+        .and_then(|()| fs::rename(source, &destination));
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&backup);
+        return Err(error);
+    }
+    Ok(destination)
+}
+
 #[derive(Clone, PartialEq)]
 pub enum LaunchSave {
     Continue,
@@ -160,6 +205,25 @@ pub fn checkpoint(root: &Path, name: &str, source: &Path) -> io::Result<PathBuf>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deleting_a_checkpoint_preserves_its_contents_and_rejects_other_folders() -> io::Result<()> {
+        let root =
+            std::env::temp_dir().join(format!("mandyhub-deleted-saves-{}", std::process::id()));
+        fs::create_dir(&root)?;
+        let result = (|| {
+            let checkpoint = root.join("checkpoints/Checkpoint - Example");
+            fs::create_dir_all(&checkpoint)?;
+            fs::write(checkpoint.join("manifest"), b"example")?;
+            assert!(delete_save(&root, &root.join("checkpoints")).is_err());
+            let deleted = delete_save(&root, &checkpoint)?;
+            assert!(!checkpoint.exists());
+            assert_eq!(fs::read(deleted.join("manifest"))?, b"example");
+            Ok(())
+        })();
+        fs::remove_dir_all(root)?;
+        result
+    }
 
     #[test]
     fn fresh_and_copied_profiles_preserve_original_and_checkpoint() -> io::Result<()> {

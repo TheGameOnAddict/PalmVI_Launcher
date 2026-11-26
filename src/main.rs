@@ -15,6 +15,7 @@ mod theme;
 mod tools;
 mod ui;
 mod saves;
+mod save_zip;
 mod build_activity;
 mod updater;
 
@@ -55,6 +56,34 @@ struct Project {
     /// A build already on this PC (not downloaded or built by the launcher).
     #[serde(default)]
     local_exe: Option<String>,
+    #[serde(default)]
+    archive_exe: Option<PathBuf>,
+}
+
+mod build_zip;
+mod rust_project;
+
+impl Project {
+    fn is_git(&self) -> bool {
+        self.local_exe.is_none() && self.archive_exe.is_none()
+    }
+
+    fn archive_program(&self) -> Option<PathBuf> {
+        self.archive_exe.as_ref().map(|exe| repo_dir(&self.repo).join(exe))
+    }
+
+    fn runs_standalone(&self) -> bool {
+        self.archive_exe.as_deref().is_some_and(|exe| !build_zip::is_victory(exe))
+            || rust_install(&self.repo).is_some()
+    }
+
+    fn web_url(&self) -> String {
+        if self.repo.contains("://") { self.repo.clone() } else { format!("https://github.com/{}", self.repo) }
+    }
+
+    fn clone_url(&self) -> String {
+        if self.repo.contains("://") { self.repo.clone() } else { format!("https://github.com/{}.git", self.repo) }
+    }
 }
 
 /// What is kept between runs.
@@ -98,13 +127,52 @@ struct ProjectLaunch {
     notes: String,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 struct GraphicsSettings {
     series_s: bool,
     render_scale: f32,
     fix_8gb: bool,
     bright_shadows: bool,
     fullscreen: bool,
+    #[serde(default)]
+    output: OutputResolution,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+enum OutputResolution {
+    #[default]
+    Default,
+    P720,
+    P936,
+    P1080,
+    P1440,
+    P2160,
+}
+
+impl OutputResolution {
+    const OPTIONS: [Self; 6] = [Self::Default, Self::P720, Self::P936, Self::P1080, Self::P1440, Self::P2160];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Game default",
+            Self::P720 => "720p",
+            Self::P936 => "936p",
+            Self::P1080 => "1080p",
+            Self::P1440 => "1440p",
+            Self::P2160 => "2160p (4K)",
+        }
+    }
+
+    fn dimensions(self) -> Option<&'static str> {
+        match self {
+            Self::Default => None,
+            Self::P720 => Some("1280x720"),
+            Self::P936 => Some("1664x936"),
+            Self::P1080 => Some("1920x1080"),
+            Self::P1440 => Some("2560x1440"),
+            Self::P2160 => Some("3840x2160"),
+        }
+    }
 }
 
 impl Saved {
@@ -115,18 +183,19 @@ impl Saved {
             fix_8gb: self.fix_8gb,
             bright_shadows: self.bright_shadows,
             fullscreen: self.fullscreen,
+            output: OutputResolution::Default,
         }
     }
 
     fn graphics_for(&self, repo: &str) -> GraphicsSettings {
-        self.project_launch.get(&repo.to_ascii_lowercase())
+        self.project_launch.get(&project_key(repo))
             .and_then(|project| project.graphics)
             .unwrap_or_else(|| self.default_graphics())
     }
 
     fn launch_overrides(&self, repo: &str) -> (Vec<String>, String) {
         let graphics = self.graphics_for(repo);
-        let project = self.project_launch.get(&repo.to_ascii_lowercase());
+        let project = self.project_launch.get(&project_key(repo));
         let args = project.and_then(|p| p.args.as_deref()).unwrap_or(&self.launch_args);
         let switches = project.and_then(|p| p.switches.as_deref());
         let mut extra = switches.map_or_else(|| self.extra_env.clone(), |_| String::new());
@@ -181,6 +250,10 @@ struct Job {
     repo: Option<String>,
     stage: String,
     log: Vec<String>,
+    omitted_log_lines: usize,
+    imported_project: Option<Project>,
+    removed_archive: Option<String>,
+    import_error: Option<String>,
     failed: bool,
     /// The process running now, while the player may stop it (a warm-up).
     pid: Option<u32>,
@@ -196,12 +269,14 @@ struct Launch {
     game_dir: PathBuf,
     series_s: bool,
     scale: f32,
+    output: OutputResolution,
     /// `VICTORY_*` lines: the player's switches and the graphics fixes.
     extra: String,
     fullscreen: bool,
     warm_first: bool,
     pipelines: bool,
     args: Vec<String>,
+    program_args: Vec<String>,
 }
 
 /// The game files `victory translate --cache` reads shaders from (those that exist are passed).
@@ -249,6 +324,7 @@ mod tests {
 
 struct App {
     saved: Saved,
+    screenshot_projects: Option<Vec<String>>,
     updater: updater::Updater,
     projects: Arc<Mutex<Option<Result<Vec<Project>, String>>>>,
     job: Arc<Mutex<Job>>,
@@ -267,6 +343,8 @@ struct App {
     /// What is known about each project's install, by repo.
     repos: Arc<Mutex<std::collections::HashMap<String, RepoState>>>,
     show_log: bool,
+    log_expanded: bool,
+    log_export_status: Option<(String, bool)>,
     /// The player's own pictures, across the top of a project's page.
     slides: slides::Slides,
     /// When every installed project was last checked for updates (seconds).
@@ -333,8 +411,37 @@ enum Kind {
     Warm,
 }
 
+fn project_key(repo: &str) -> String {
+    if repo.contains("://") { repo.to_owned() } else { repo.to_ascii_lowercase() }
+}
+
 fn slug(repo: &str) -> String {
+    if repo.contains("://") {
+        let hash = ring::digest::digest(&ring::digest::SHA256, repo.as_bytes());
+        let hex: String = hash.as_ref()[..16].iter().map(|byte| format!("{byte:02x}")).collect();
+        return format!("git-{hex}");
+    }
     repo.replace('/', "_")
+}
+
+#[derive(Serialize, Deserialize)]
+struct RustInstall {
+    executable: Option<PathBuf>,
+}
+
+fn rust_install_file(repo: &str) -> PathBuf {
+    target_dir(repo).join("mandyhub-rust.json")
+}
+
+fn rust_install(repo: &str) -> Option<RustInstall> {
+    serde_json::from_slice(&std::fs::read(rust_install_file(repo)).ok()?).ok()
+}
+
+fn project_installed(repo: &str) -> bool {
+    match rust_install(repo) {
+        Some(install) => install.executable.is_none_or(|exe| target_dir(repo).join(exe).is_file()),
+        None => built_exe(repo).is_file(),
+    }
 }
 fn repo_dir(repo: &str) -> PathBuf {
     workspace().join("repos").join(slug(repo))
@@ -354,27 +461,29 @@ fn built_exe(repo: &str) -> PathBuf {
     executable
 }
 
-/// Most projects build at the root. Some wrap a VIctory workspace one level down.
+/// Most projects build at the root. Some wrap a Cargo workspace one level down.
 fn cargo_workspace(repo: &Path) -> Result<PathBuf, String> {
     if repo.join("Cargo.toml").is_file() {
         return Ok(repo.to_owned());
     }
     let entries = std::fs::read_dir(repo).map_err(|error| format!("Could not inspect {}: {error}", repo.display()))?;
-    let mut matches = Vec::new();
+    let mut nested = Vec::new();
+    let mut victory = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("Could not inspect {}: {error}", repo.display()))?;
         let path = entry.path();
-        if entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && path.join("Cargo.toml").is_file()
-            && path.join("apps/victory/Cargo.toml").is_file()
-        {
-            matches.push(path);
+        if entry.file_type().is_ok_and(|kind| kind.is_dir()) && path.join("Cargo.toml").is_file() {
+            if path.join("apps/victory/Cargo.toml").is_file() {
+                victory.push(path.clone());
+            }
+            nested.push(path);
         }
     }
-    match matches.as_slice() {
+    let candidates = if victory.is_empty() { &nested } else { &victory };
+    match candidates.as_slice() {
         [workspace] => Ok(workspace.clone()),
-        [] => Err(format!("No Cargo.toml at {} and no nested VIctory workspace found.", repo.display())),
-        _ => Err(format!("Multiple nested VIctory workspaces found in {}.", repo.display())),
+        [] => Err(format!("No Cargo.toml found at {} or one folder down.", repo.display())),
+        _ => Err(format!("Multiple nested Cargo projects found in {}. Put a workspace manifest at the repository root.", repo.display())),
     }
 }
 
@@ -440,9 +549,9 @@ fn built_file(repo: &str) -> PathBuf {
 
 /// The newest commit of `p`'s branch online (`git ls-remote`, no download).
 fn remote_head(p: &Project) -> Option<String> {
-    let url = format!("https://github.com/{}.git", p.repo);
+    let url = p.clone_url();
     let mut c = tools::git();
-    c.arg("ls-remote").arg(&url);
+    c.args(["ls-remote", "--"]).arg(&url);
     match &p.branch {
         Some(b) => c.arg(format!("refs/heads/{b}")),
         None => c.arg("HEAD"),
@@ -450,16 +559,25 @@ fn remote_head(p: &Project) -> Option<String> {
     hide_window(&mut c);
     let out = c.output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
-    text.split_whitespace().next().filter(|h| h.len() == 40).map(str::to_string)
+    text.split_whitespace().next()
+        .filter(|hash| matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .map(str::to_string)
 }
 
 fn repo_state(p: &Project) -> RepoState {
+    if let Some(exe) = p.archive_program() {
+        return RepoState {
+            installed: exe.is_file(),
+            activity: build_activity::BuildActivity::read(&target_dir(&p.repo)),
+            ..RepoState::default()
+        };
+    }
     if let Some(exe) = &p.local_exe {
         return RepoState { installed: Path::new(exe).is_file(), built: Some("local".into()), ..RepoState::default() };
     }
     RepoState {
         checking: false,
-        installed: built_exe(&p.repo).is_file(),
+        installed: project_installed(&p.repo),
         built: std::fs::read_to_string(built_file(&p.repo)).ok().map(|s| s.trim().to_string()),
         remote: remote_head(p),
         activity: build_activity::BuildActivity::read(&target_dir(&p.repo)),
@@ -552,7 +670,7 @@ fn set_install_dir(dir: &str) {
 }
 
 /// The parts of an install folder that belong to projects.
-const PROJECT_PARTS: &[&str] = &["repos", "target", "cache", "data", "checkpoints"];
+const PROJECT_PARTS: &[&str] = &["repos", "target", "cache", "data", "checkpoints", "deleted-saves"];
 
 /// Whether `dir` holds any installed project.
 fn has_projects(dir: &Path) -> bool {
@@ -631,6 +749,55 @@ fn names_the_game(s: &str) -> bool {
 }
 
 /// `owner/name` from a GitHub link or `owner/name` itself.
+fn parse_git_repo(link: &str) -> Option<String> {
+    let link = link.trim();
+    let normalized;
+    let link = if !link.contains("://") && link.split('/').next()?.contains('.') && !link.starts_with("github.com/") {
+        normalized = format!("https://{link}");
+        &normalized
+    } else {
+        link
+    };
+    if !link.contains("://") {
+        return parse_repo(link);
+    }
+    let mut url = url::Url::parse(link).ok()?;
+    if !matches!(url.scheme(), "https" | "http" | "ssh" | "git")
+        || url.host_str().is_none()
+        || (url.scheme() != "ssh" && !url.username().is_empty())
+        || url.password().is_some() || url.query().is_some() || url.fragment().is_some()
+    {
+        return None;
+    }
+    let path = url.path().trim_end_matches('/').to_owned();
+    if path.is_empty() {
+        return None;
+    }
+    if url.host_str() == Some("github.com") && matches!(url.scheme(), "https" | "http") && url.port().is_none() {
+        return parse_repo(url.as_str());
+    }
+    url.set_path(&path);
+    Some(url.into())
+}
+
+#[cfg(test)]
+#[test]
+fn custom_git_links_preserve_non_github_paths_and_old_github_ids() {
+    assert_eq!(parse_git_repo("https://github.com/Owner/Project.git").as_deref(), Some("Owner/Project"));
+    assert_eq!(parse_git_repo("Owner/Project").as_deref(), Some("Owner/Project"));
+    assert_eq!(
+        parse_git_repo("gitlab.example.org/group/SubGroup/Project.git").as_deref(),
+        Some("https://gitlab.example.org/group/SubGroup/Project.git")
+    );
+    assert_eq!(
+        parse_git_repo("ssh://git@192.0.2.1:2222/group/project.git").as_deref(),
+        Some("ssh://git@192.0.2.1:2222/group/project.git")
+    );
+    for invalid in ["file:///C:/", "ext::cmd/path", "https://user:password@git.example/repo", "https://git.example/"] {
+        assert!(parse_git_repo(invalid).is_none(), "{invalid}");
+    }
+}
+
 fn parse_repo(link: &str) -> Option<String> {
     let s = link.trim().trim_end_matches('/').trim_end_matches(".git");
     let s = s
@@ -640,7 +807,7 @@ fn parse_repo(link: &str) -> Option<String> {
         .unwrap_or(s);
     let mut parts = s.split('/');
     let (owner, name) = (parts.next()?, parts.next()?);
-    let ok = |p: &str| !p.is_empty() && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
+    let ok = |p: &str| p.chars().any(|c| c.is_ascii_alphanumeric()) && p.chars().all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c));
     (ok(owner) && ok(name)).then(|| format!("{owner}/{name}"))
 }
 
@@ -676,6 +843,7 @@ fn fetch_portwatch() -> Result<Vec<Project>, String> {
                 summary: clean_text(e["summary"].as_str().unwrap_or("")),
                 custom: false,
                 local_exe: None,
+                archive_exe: None,
                 repo,
             })
         })
@@ -695,6 +863,59 @@ pub(crate) fn hide_window(c: &mut Command) {
 pub(crate) fn hide_window(_: &mut Command) {}
 
 impl App {
+    fn import_build_zip(&mut self, ctx: &egui::Context, input: PathBuf) {
+        let name = input.file_stem().and_then(|name| name.to_str()).unwrap_or("Imported build").to_owned();
+        let job = self.job.clone();
+        let ctx = ctx.clone();
+        {
+            let mut state = job.lock().unwrap();
+            if state.running {
+                return;
+            }
+            *state = Job { running: true, stage: "Extracting build ZIP".into(), ..Job::default() };
+        }
+        self.log_export_status = None;
+        std::thread::spawn(move || {
+            let result = (|| -> Result<Project, String> {
+                use ring::rand::{SecureRandom, SystemRandom};
+                let mut id = [0; 16];
+                SystemRandom::new().fill(&mut id).map_err(|_| "Could not create a build ID.")?;
+                let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+                let repo = format!("archive://{hex}");
+                std::fs::create_dir_all(workspace().join("repos")).map_err(|error| error.to_string())?;
+                let folder = repo_dir(&repo);
+                let executable = build_zip::extract(&input, &folder)?;
+                let target = target_dir(&repo);
+                if let Err(error) = std::fs::create_dir_all(&target)
+                    .and_then(|_| std::fs::write(built_file(&repo), "zip"))
+                    .and_then(|_| build_activity::BuildActivity::record_build(&target, false))
+                {
+                    job.lock().unwrap().log.push(format!("Could not record the import date: {error}"));
+                }
+                Ok(Project {
+                    name, repo, archive_exe: Some(executable), custom: true,
+                    branch: None, gpu: Vec::new(), fps: None, render: None, verified: false,
+                    summary: String::new(), local_exe: None,
+                })
+            })();
+            let mut state = job.lock().unwrap();
+            state.running = false;
+            match result {
+                Ok(project) => {
+                    state.stage = "Build imported".into();
+                    state.imported_project = Some(project);
+                }
+                Err(error) => {
+                    state.stage = "Build import failed".into();
+                    state.failed = true;
+                    state.log.push(format!("ERROR: {error}"));
+                    state.import_error = Some(error);
+                }
+            }
+            ctx.request_repaint();
+        });
+    }
+
     fn new(cc: &eframe::CreationContext<'_>) -> App {
         theme::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
@@ -704,6 +925,7 @@ impl App {
         }
         let mut app = App {
             saved,
+            screenshot_projects: None,
             updater: updater::Updater::default(),
             projects: Arc::new(Mutex::new(None)),
             job: Arc::new(Mutex::new(Job::default())),
@@ -717,6 +939,8 @@ impl App {
             finding: Arc::new(Mutex::new(None)),
             repos: Arc::new(Mutex::new(std::collections::HashMap::new())),
             show_log: false,
+            log_expanded: false,
+            log_export_status: None,
             slides: slides::Slides::new(),
             last_auto_check: -1.0,
             view: View::Projects,
@@ -739,6 +963,7 @@ impl App {
             app.saved.render_scale = 0.5;
         }
         set_install_dir(&app.saved.install_dir);
+        app.updater.check(&cc.egui_ctx);
         app.refresh_projects(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let job = app.job.clone();
@@ -822,7 +1047,7 @@ impl App {
 
     /// A newer version online than the one installed, and not put off.
     fn update_for(&self, p: &Project) -> Option<String> {
-        if p.local_exe.is_some() {
+        if !p.is_git() {
             return None;
         }
         // Not while this project is being installed or updated.
@@ -835,7 +1060,7 @@ impl App {
         let remote = self.state_of(&p.repo)?.remote?;
         // What is installed now, from disk: a check that started before the
         // last update finished must not bring the old version back.
-        if !built_exe(&p.repo).is_file() {
+        if !project_installed(&p.repo) {
             return None;
         }
         let built = std::fs::read_to_string(built_file(&p.repo)).ok().map(|s| s.trim().to_string());
@@ -854,18 +1079,25 @@ impl App {
             *j = Job { running: true, stage: "Starting".into(), repo: Some(p.repo.clone()), ..Default::default() };
         }
         // An install over an installed project is an update.
-        let updating = kind == Kind::Install && built_exe(&p.repo).is_file();
+        let updating = kind == Kind::Install && project_installed(&p.repo);
+        if kind == Kind::Install || kind == Kind::Warm {
+            self.show_log = true;
+        }
+        self.log_export_status = None;
         let (args, extra) = self.saved.launch_overrides(&p.repo);
         let graphics = self.saved.graphics_for(&p.repo);
         let launch = Launch {
             game_dir: PathBuf::from(&self.saved.game_dir),
             series_s: graphics.series_s,
             scale: graphics.render_scale,
+            output: graphics.output,
             extra,
             fullscreen: graphics.fullscreen,
             warm_first: self.saved.warm_before_play,
             pipelines: self.saved.warm_pipelines,
             args,
+            program_args: self.saved.project_launch.get(&project_key(&p.repo))
+                .and_then(|settings| settings.args.as_deref()).map(split_args).unwrap_or_default(),
         };
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
@@ -883,10 +1115,13 @@ impl App {
                 match r {
                     _ if j.stopped => j.stage = "Stopped".into(),
                     Ok(()) => {
+                        if kind == Kind::Uninstall && p.archive_exe.is_some() {
+                            j.removed_archive = Some(p.repo.clone());
+                        }
                         j.stage = match kind {
                             Kind::Install if updating => "Updated: ready to play".into(),
                             Kind::Install => "Installed: ready to play".into(),
-                            Kind::Play(_) => "Game closed".into(),
+                            Kind::Play(_) => if p.runs_standalone() { "Program closed".into() } else { "Game closed".into() },
                             Kind::Uninstall => "Uninstalled".into(),
                             Kind::Warm => "Shaders warmed up: ready to play".into(),
                         }
@@ -930,7 +1165,7 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, updating: bo
     let ws = workspace();
     std::fs::create_dir_all(ws.join("repos")).map_err(|e| format!("cannot make {}: {e}", ws.display()))?;
     let dir = repo_dir(&p.repo);
-    let url = format!("https://github.com/{}.git", p.repo);
+    let url = p.clone_url();
     if dir.join(".git").is_dir() {
         stage(job, ctx, "Downloading the new version");
         let refspec = p.branch.clone().unwrap_or_else(|| "HEAD".into());
@@ -943,26 +1178,12 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, updating: bo
         if let Some(b) = &p.branch {
             c.args(["--branch", b]);
         }
-        c.arg(&url).arg(&dir);
+        c.arg("--").arg(&url).arg(&dir);
         run(job, ctx, &mut c)?;
     }
     stage(job, ctx, "Building (the first time takes several minutes)");
     let target = target_dir(&p.repo);
-    let workspace = cargo_workspace(&dir)?;
-    let profile = detect_build_profile(&workspace);
-    let has_lockfile = workspace.join("Cargo.lock").is_file();
-    let mut cargo = tools::cargo();
-    cargo.args(["build", "--profile", profile, "-p", "victory", "--target-dir"]);
-    cargo.arg(&target);
-    if has_lockfile {
-        cargo.arg("--locked");
-    }
-    cargo.current_dir(&workspace);
-    run(job, ctx, &mut cargo)?;
-    let executable = target.join(profile).join("victory.exe");
-    if !executable.is_file() {
-        return Err(format!("the build made no {}", executable.display()));
-    }
+    build_project(job, ctx, p, &dir, &target)?;
     let mut c = tools::git();
     c.args(["rev-parse", "HEAD"]).current_dir(&dir);
     hide_window(&mut c);
@@ -974,6 +1195,55 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, updating: bo
                 job.lock().unwrap().log.push(format!("Could not record the update: {error}"));
             }
         }
+    }
+    Ok(())
+}
+
+fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &Path, target: &Path) -> Result<(), String> {
+    let workspace = cargo_workspace(dir)?;
+    let metadata = rust_project::metadata(&workspace)?;
+    let victory = !p.custom || rust_project::is_victory(&workspace, &metadata);
+    let profile = if victory { detect_build_profile(&workspace) } else { "release" };
+    let has_lockfile = workspace.join("Cargo.lock").is_file();
+    let mut cargo = tools::cargo();
+    cargo.args(["build", "--profile", profile, "--target-dir"]);
+    cargo.arg(target);
+    if has_lockfile {
+        cargo.arg("--locked");
+    }
+    cargo.current_dir(&workspace);
+    if victory {
+        cargo.args(["-p", "victory"]);
+        run(job, ctx, &mut cargo)?;
+        let executable = target.join(profile).join("victory.exe");
+        if !executable.is_file() {
+            return Err(format!("the build made no {}", executable.display()));
+        }
+        let marker = rust_install_file(&p.repo);
+        if marker.exists() {
+            std::fs::remove_file(marker).map_err(|error| error.to_string())?;
+        }
+    } else {
+        cargo.args(["--workspace", "--message-format=json-render-diagnostics"]);
+        let artifacts = Arc::new(Mutex::new(Vec::new()));
+        let captured = artifacts.clone();
+        run_with_output(job, ctx, &mut cargo, |_| {}, move |line| {
+            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else { return Some(line) };
+            if message["reason"] == "compiler-artifact" && message["executable"].is_string() {
+                captured.lock().unwrap().push(message);
+                return None;
+            }
+            message["message"]["rendered"].as_str().map(str::to_owned)
+        })?;
+        let artifacts = artifacts.lock().unwrap();
+        let executable = rust_project::select_executable(&metadata, &artifacts)
+            .map(|exe| Path::new(exe).strip_prefix(target).map(Path::to_owned))
+            .transpose().map_err(|_| "Cargo reported an executable outside the install folder")?;
+        let marker = rust_install_file(&p.repo);
+        let temporary = marker.with_extension("tmp");
+        let record = serde_json::to_vec(&RustInstall { executable }).map_err(|error| error.to_string())?;
+        std::fs::write(&temporary, record).and_then(|_| std::fs::rename(&temporary, &marker))
+            .map_err(|error| format!("Could not record the installed Rust project: {error}"))?;
     }
     Ok(())
 }
@@ -997,7 +1267,8 @@ fn uninstall(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<
 
 /// The victory.exe `p` runs with: its build, or a build already on this PC.
 fn project_exe(p: &Project) -> Result<PathBuf, String> {
-    let exe = p.local_exe.as_ref().map(PathBuf::from).unwrap_or_else(|| built_exe(&p.repo));
+    let exe = p.archive_program().or_else(|| p.local_exe.as_ref().map(PathBuf::from))
+        .unwrap_or_else(|| built_exe(&p.repo));
     if exe.is_file() {
         Ok(exe)
     } else {
@@ -1009,12 +1280,24 @@ fn project_exe(p: &Project) -> Result<PathBuf, String> {
 /// Play: the project's own env vars (from its scripts/play.ps1) first, then
 /// the mode, its data and cache folders, and the player's switches.
 fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
+    if let Some(program) = p.archive_program() {
+        if let Some(directory) = program.parent() {
+            c.current_dir(directory);
+            for (key, value) in build_zip::launch_defaults(directory) {
+                c.env(key, value);
+            }
+        }
+        c.env("VICTORY_GAME_DIR", &l.game_dir);
+    }
     for (k, v) in detect_launch_env(&repo_dir(&p.repo)) {
         c.env(&k, &v);
     }
     if l.series_s {
         c.env("VICTORY_OWN_UPSCALER", "1");
         c.env("VICTORY_RENDER_SCALE", format!("{:.2}", l.scale));
+    }
+    if let Some(size) = l.output.dimensions() {
+        c.env("VICTORY_OUTPUT", size);
     }
     let ws = workspace();
     let data = ws.join("data").join(slug(&p.repo));
@@ -1101,6 +1384,24 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> 
 
 /// Starts the installed build of `p`, warming its shaders first when the player asked for that.
 fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, choice: &saves::LaunchSave) -> Result<(), String> {
+    if p.runs_standalone() {
+        let (exe, dir) = if let Some(exe) = p.archive_program() {
+            let dir = exe.parent().ok_or("The archive executable has no parent folder.")?.to_owned();
+            (exe, dir)
+        } else {
+            let exe = rust_install(&p.repo).and_then(|install| install.executable)
+                .ok_or("This Rust workspace has no runnable binary.")?;
+            (target_dir(&p.repo).join(exe), cargo_workspace(&repo_dir(&p.repo))?)
+        };
+        let mut command = Command::new(exe);
+        command.current_dir(dir).args(&l.program_args);
+        stage(job, ctx, "Playing");
+        return run_with(job, ctx, &mut command, |_| {
+            if let Err(error) = build_activity::BuildActivity::record_run(&target_dir(&p.repo)) {
+                job.lock().unwrap().log.push(format!("Could not record the launch: {error}"));
+            }
+        });
+    }
     let exe = project_exe(p)?;
     if l.warm_first {
         if let Err(e) = warm(job, ctx, p, l) {
@@ -1113,8 +1414,10 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
     stage(job, ctx, "Playing");
     let mut c = Command::new(&exe);
     c.arg("run").arg(l.game_dir.join(EXE_NAME)).arg("--execute");
-    if l.series_s {
-        c.args(["--console", "series-s"]);
+    let explicit_console = l.args.iter().take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--console" || arg.starts_with("--console="));
+    if !explicit_console && (l.series_s || l.output != OutputResolution::Default) {
+        c.args(["--console", if l.series_s { "series-s" } else { "series-x" }]);
     }
     // The player's own: more `run` flags, and after `--` the game's.
     c.args(&l.args);
@@ -1144,27 +1447,42 @@ fn run(job: &Arc<Mutex<Job>>, ctx: &egui::Context, c: &mut Command) -> Result<()
 
 /// [`run`], telling `spawned` the process id once it started.
 fn run_with(job: &Arc<Mutex<Job>>, ctx: &egui::Context, c: &mut Command, spawned: impl FnOnce(u32)) -> Result<(), String> {
+    run_with_output(job, ctx, c, spawned, Some)
+}
+
+fn run_with_output(
+    job: &Arc<Mutex<Job>>,
+    ctx: &egui::Context,
+    c: &mut Command,
+    spawned: impl FnOnce(u32),
+    filter: impl Fn(String) -> Option<String> + Send + Sync + 'static,
+) -> Result<(), String> {
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     hide_window(c);
     let mut child = c.spawn().map_err(|e| format!("could not start {:?}: {e}", c.get_program()))?;
     spawned(child.id());
     let (out, err) = (child.stdout.take(), child.stderr.take());
-    let pipe = |r: Box<dyn std::io::Read + Send>| {
+    let filter = Arc::new(filter);
+    let pipe = |r: Box<dyn std::io::Read + Send>, filter_stdout: bool| {
         let (job, ctx) = (job.clone(), ctx.clone());
+        let filter = filter.clone();
         std::thread::spawn(move || {
-            for line in BufReader::new(r).lines().map_while(Result::ok) {
+            for bytes in BufReader::new(r).split(b'\n').map_while(Result::ok) {
+                let line = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(&bytes)).into_owned();
+                let Some(line) = (if filter_stdout { filter(line) } else { Some(line) }) else { continue };
                 let mut j = job.lock().unwrap();
                 j.log.push(line);
                 if j.log.len() > 4000 {
                     j.log.drain(..1000);
+                    j.omitted_log_lines += 1000;
                 }
                 drop(j);
                 ctx.request_repaint();
             }
         })
     };
-    let a = out.map(|o| pipe(Box::new(o)));
-    let b = err.map(|e| pipe(Box::new(e)));
+    let a = out.map(|o| pipe(Box::new(o), true));
+    let b = err.map(|e| pipe(Box::new(e), false));
     let status = child.wait().map_err(|e| e.to_string())?;
     for t in [a, b].into_iter().flatten() {
         let _ = t.join();
@@ -1177,7 +1495,23 @@ impl eframe::App for App {
         eframe::set_value(storage, eframe::APP_KEY, &self.saved);
     }
 
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.updater.poll();
+        let (imported, removed) = {
+            let mut job = self.job.lock().unwrap();
+            (job.imported_project.take(), job.removed_archive.take())
+        };
+        if let Some(project) = imported {
+            self.saved.selected = Some(project.repo.clone());
+            self.saved.custom.insert(0, project);
+            self.view = View::Projects;
+        }
+        if let Some(repo) = removed {
+            self.saved.custom.retain(|project| project.repo != repo);
+            if self.saved.selected.as_deref() == Some(&repo) {
+                self.saved.selected = None;
+            }
+        }
         if !self.title_bar_done {
             self.title_bar_done = fullscreen::dark_title_bar(std::process::id(), theme::BG, theme::WHITE);
         }
@@ -1192,6 +1526,21 @@ impl eframe::App for App {
             }
         }
         self.draw(ctx);
+        if self.updater.restart_requested && !self.job.lock().unwrap().running {
+            if let updater::State::Downloaded(update) = &self.updater.state {
+                self.updater.restart_requested = false;
+                if let Some(storage) = frame.storage_mut() {
+                    eframe::set_value(storage, eframe::APP_KEY, &self.saved);
+                    storage.flush();
+                }
+                match updater::restart_with(update) {
+                    Ok(()) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                    Err(error) => self.updater.restart_error = Some(error),
+                }
+            }
+        } else if matches!(self.updater.state, updater::State::Downloaded(_)) {
+            self.updater.restart_requested = false;
+        }
     }
 }
 
@@ -1207,6 +1556,7 @@ impl App {
             *j = Job { running: true, stage: "Installing tools (Windows will ask for permission)".into(), ..Default::default() };
         }
         self.show_log = true;
+        self.log_export_status = None;
         let ctx = ctx.clone();
         std::thread::spawn(move || {
             let have = tools::detect();
@@ -1316,7 +1666,7 @@ impl App {
         }
         self.last_auto_check = now;
         for p in self.all_projects() {
-            if p.local_exe.is_none() && built_exe(&p.repo).is_file() {
+            if p.is_git() && project_installed(&p.repo) {
                 self.check_repo(ctx, &p);
             }
         }

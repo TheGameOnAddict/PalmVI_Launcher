@@ -4,8 +4,8 @@
 //! main.rs.
 
 use crate::theme::{self, glyph, Look, Size, Stat};
-use crate::{built_exe, default_workspace, parse_repo, search_drives, slides, tools, workspace};
-use crate::{AddRepo, App, GraphicsSettings, Kind, Project, RepoState, View};
+use crate::{default_workspace, parse_git_repo, project_installed, project_key, rust_install, search_drives, slides, tools, workspace};
+use crate::{AddRepo, App, GraphicsSettings, Kind, OutputResolution, Project, RepoState, View};
 use eframe::egui::{self, vec2, Align, Color32, Frame, Label, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::time::Duration;
 
@@ -18,6 +18,8 @@ const MODES: [(&str, bool, f32, &str); 3] = [
     ("Balanced", true, 0.75, "Renders at three quarters and scales up."),
     ("Best quality", false, 1.0, "Renders at full resolution."),
 ];
+const PROJECT_GRAPHICS_WIDTH: f32 = 310.0;
+const GRAPHICS_BAND_HEIGHT: f32 = 40.0;
 
 fn note(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::FAINT));
@@ -47,6 +49,10 @@ fn graphics_controls(ui: &mut Ui, graphics: &mut GraphicsSettings) {
         note(ui, &description);
     });
     ui.add_space(20.0);
+    graphics_options(ui, graphics);
+}
+
+fn graphics_options(ui: &mut Ui, graphics: &mut GraphicsSettings) {
     theme::toggle(ui, &mut graphics.fix_8gb, "8 GB graphics card fix", "Smaller textures, and grey in place of missing ones.");
     ui.add_space(14.0);
     theme::toggle(ui, &mut graphics.bright_shadows, "Brighter shadows", "A steady ambient light where ray tracing does not run.");
@@ -112,6 +118,12 @@ fn short_stage(stage: &str) -> &'static str {
 }
 
 impl App {
+    fn screenshot_alias(&self, repo: &str) -> Option<(String, String)> {
+        let projects = self.screenshot_projects.as_ref()?;
+        let index = projects.iter().position(|project| project == repo).map_or(projects.len() + 1, |i| i + 1);
+        Some((format!("Example Project {index:02}"), format!("example/project-{index:02}")))
+    }
+
     /// The whole window, every frame.
     pub(crate) fn draw(&mut self, ctx: &egui::Context) {
         self.tools = tools::current();
@@ -166,8 +178,13 @@ impl App {
                         self.view = if i == 0 { View::Projects } else { View::Settings };
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if theme::button(ui, Look::Night, Some(glyph::ADD), "Add repo").clicked() {
+                        if self.screenshot_projects.is_none() && theme::button(ui, Look::Night, Some(glyph::ADD), "Import Repo/Zip").clicked() {
                             self.open_add_repo();
+                        }
+                        if matches!(self.updater.state, crate::updater::State::Available(_))
+                            && theme::button(ui, Look::Night, Some(glyph::DOWNLOAD), "Launcher update").clicked()
+                        {
+                            self.open_launcher_updates(ctx);
                         }
                     });
                 });
@@ -188,8 +205,9 @@ impl App {
                     if self.files_ok() {
                         theme::dot(ui, theme::GOOD);
                         small(ui, "Game files found", theme::MUTED);
-                        let dir = self.saved.game_dir.clone();
-                        ui.allocate_ui(vec2(300.0, 20.0), |ui| {
+                        let dir = if self.screenshot_projects.is_some() { "Path hidden".into() } else { self.saved.game_dir.clone() };
+                        let path_width = (ui.available_width() - 640.0).clamp(60.0, 300.0);
+                        ui.allocate_ui(vec2(path_width, 20.0), |ui| {
                             ui.add(Label::new(RichText::new(dir).font(theme::regular(12.5)).color(theme::FAINT)).truncate());
                         });
                     } else {
@@ -218,9 +236,20 @@ impl App {
                         }
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        let mut screenshot = self.screenshot_projects.is_some();
+                        if ui.checkbox(&mut screenshot, "Screenshot mode").on_hover_text("Replace repo names and hide private text for screenshots").changed() {
+                            self.screenshot_projects = screenshot.then(|| self.all_projects().into_iter().map(|project| project.repo).collect());
+                        }
+                        theme::divider(ui);
                         let label = format!("Default graphics: {}", self.mode_name());
                         if theme::small(ui, Look::Ghost, Some(glyph::SETTINGS), &label, true).clicked() {
                             self.view = View::Settings;
+                        }
+                        theme::divider(ui);
+                        let ready = !matches!(self.updater.state, crate::updater::State::Checking | crate::updater::State::Downloading);
+                        if theme::small(ui, Look::Ghost, Some(glyph::SYNC), "Check for update", ready).clicked() {
+                            self.updater.check(ctx);
+                            self.open_launcher_updates(ctx);
                         }
                     });
                 });
@@ -231,7 +260,11 @@ impl App {
         // The controls stop where the rows stop: the 10 px past that is the scroll bar's.
         ui.horizontal(|ui| {
             let w = ui.available_width() - 10.0 - theme::CONTROL_H - ui.spacing().item_spacing.x;
-            theme::field(ui, &mut self.search, "Search projects", w, Some(glyph::SEARCH));
+            if self.screenshot_projects.is_some() {
+                theme::field(ui, &mut String::new(), "Search hidden", w, Some(glyph::SEARCH));
+            } else {
+                theme::field(ui, &mut self.search, "Search projects", w, Some(glyph::SEARCH));
+            }
             if theme::icon_button(ui, Look::Secondary, Size::Normal, glyph::REFRESH, "Reload the list from PortWatch").clicked() {
                 self.refresh_projects(ctx);
             }
@@ -248,7 +281,7 @@ impl App {
             note(ui, "Update to try");
         });
 
-        let query = self.search.trim().to_lowercase();
+        let query = if self.screenshot_projects.is_some() { String::new() } else { self.search.trim().to_lowercase() };
         let filter = self.saved.gpu_filter;
         let keep = |p: &Project| {
             let text = query.is_empty() || p.name.to_lowercase().contains(&query) || p.repo.to_lowercase().contains(&query);
@@ -285,7 +318,7 @@ impl App {
                 Some(Err(e)) => {
                     group(ui, "From PortWatch", None);
                     theme::callout(ui, theme::BAD, glyph::WARNING, |ui| {
-                        wrapped(ui, e, theme::MUTED);
+                        wrapped(ui, if self.screenshot_projects.is_some() { "Project list unavailable." } else { e }, theme::MUTED);
                         if theme::small(ui, Look::Secondary, Some(glyph::REFRESH), "Try again", true).clicked() {
                             retry = true;
                         }
@@ -364,7 +397,9 @@ impl App {
             .and_then(|state| state.activity.as_ref())
             .and_then(|activity| activity.pending_label());
         let dot_w = if pending.is_some() { 14.0 } else { 0.0 };
-        let name = theme::one_line(ui, &p.name, theme::strong(14.5), theme::WHITE, right - left - fps_w - tick_w - dot_w);
+        let alias = self.screenshot_alias(&p.repo);
+        let (display_name, display_repo) = alias.as_ref().map_or((p.name.as_str(), p.repo.as_str()), |(name, repo)| (name.as_str(), repo.as_str()));
+        let name = theme::one_line(ui, display_name, theme::strong(14.5), theme::WHITE, right - left - fps_w - tick_w - dot_w);
         let name_size = name.size();
         let y1 = rect.top() + 10.0;
         painter.galley(egui::pos2(left, y1), name, theme::WHITE);
@@ -394,7 +429,7 @@ impl App {
                 painter.galley(egui::pos2(left, y2 + 2.0), g, color);
             }
             None => {
-                let repo = theme::one_line(ui, &p.repo, theme::regular(12.0), theme::FAINT, right - left - fps_w);
+                let repo = theme::one_line(ui, display_repo, theme::regular(12.0), theme::FAINT, right - left - fps_w);
                 painter.galley(egui::pos2(left, y2), repo, theme::FAINT);
             }
         }
@@ -452,7 +487,7 @@ impl App {
         };
         theme::ground(ui.painter(), ui.max_rect());
         egui::ScrollArea::vertical().id_salt("page").auto_shrink([false; 2]).show(ui, |ui| {
-            let pictures = self.slides.ready(ctx);
+            let pictures = self.screenshot_projects.is_none() && self.slides.ready(ctx);
             if pictures {
                 let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 200.0), Sense::hover());
                 self.slides.paint_in(ui.painter(), rect, now as f32, theme::BG);
@@ -469,14 +504,18 @@ impl App {
                 self.page_header(ui, ctx, &p);
                 self.profile_tabs(ui, ctx, &p);
                 ui.add_space(36.0);
-                self.activity(ui);
+                if self.screenshot_projects.is_none() {
+                    self.activity(ui);
+                }
             });
         });
     }
 
     /// Where it comes from, its name, the main action and the repo link buttons.
     fn page_header(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Project) {
-        let (eyebrow, eyebrow_color) = if p.custom {
+        let (eyebrow, eyebrow_color) = if p.archive_exe.is_some() {
+            ("Imported ZIP", theme::LILAC)
+        } else if p.custom {
             ("Added by link", theme::WARN)
         } else if p.verified {
             ("Verified by PortWatch", theme::LILAC)
@@ -485,8 +524,14 @@ impl App {
         };
         theme::caps(ui, eyebrow, 11.5, eyebrow_color);
         let width = ui.available_width();
-        theme::title(ui, &p.name, 72.0, width);
-        ui.label(RichText::new(format!("github.com/{}", p.repo)).font(theme::regular(13.5)).color(theme::MUTED));
+        let alias = self.screenshot_alias(&p.repo);
+        let private = alias.is_some();
+        let (display_name, display_repo) = alias.as_ref().map_or((p.name.as_str(), p.repo.as_str()), |(name, repo)| (name.as_str(), repo.as_str()));
+        theme::title(ui, display_name, 72.0, width);
+        if p.archive_exe.is_none() {
+            let display_repo = if display_repo.contains("://") { display_repo.to_owned() } else { format!("github.com/{display_repo}") };
+            ui.add(Label::new(RichText::new(display_repo).font(theme::regular(13.5)).color(theme::MUTED)).truncate());
+        }
         ui.add_space(20.0);
 
         let (running, job_repo, stage) = {
@@ -502,47 +547,77 @@ impl App {
             }
         };
         // While the first look runs, what is on disk already says installed or not.
-        let installed = st.installed || (st.checking && p.local_exe.is_none() && built_exe(&p.repo).is_file());
+        let installed = st.installed || (st.checking && (
+            p.archive_program().is_some_and(|exe| exe.is_file())
+            || (p.is_git() && project_installed(&p.repo))
+        ));
+        let rust = installed.then(|| rust_install(&p.repo)).flatten();
+        let victory = !p.runs_standalone();
+        let runnable = !victory && (p.archive_exe.is_some() || rust.is_some_and(|install| install.executable.is_some()));
         let tools = self.tools.clone();
         let tools_ok = tools.as_ref().is_some_and(|t| t.ready());
-        let url = format!("https://github.com/{}", p.repo);
+        let url = p.web_url();
+        let browser_link = url.starts_with("https://") || url.starts_with("http://");
         let now = ctx.input(|i| i.time);
 
-        ui.horizontal_wrapped(|ui| {
+        const GRAPHICS_GAP: f32 = 26.0;
+        const ACTION_BUTTON_HEIGHT: f32 = 46.0;
+        let graphics_below = ui.available_width() < 800.0;
+        let actions = |app: &mut Self, ui: &mut Ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (icon, label) = if this_job {
                 (None, short_stage(&stage))
             } else if installed {
-                (Some(glyph::PLAY), "Play")
+                if victory || runnable { (Some(glyph::PLAY), "Play") } else { (Some(glyph::CHECK), "Built") }
             } else {
                 (Some(glyph::DOWNLOAD), "Install project")
             };
-            let enabled = !running && if installed { self.files_ok() } else { tools_ok };
+            let enabled = !running && if installed { runnable || (victory && app.files_ok()) } else { p.is_git() && tools_ok };
             if theme::button_ex(ui, Look::Primary, Size::Large, icon, label, enabled, this_job).clicked() {
-                if installed {
-                    self.save_picker = Some(SavePicker::new(p.clone()));
+                if installed && runnable {
+                    app.start(ctx, p.clone(), Kind::Play(crate::saves::LaunchSave::Continue));
+                } else if installed {
+                    app.save_picker = Some(SavePicker::new(p.clone()));
                 } else {
-                    self.start(ctx, p.clone(), Kind::Install);
+                    app.start(ctx, p.clone(), Kind::Install);
                 }
             }
-            if theme::button_ex(ui, Look::Secondary, Size::Large, Some(glyph::OPEN), "Open on GitHub", true, false)
-                .on_hover_text(&url)
+            if browser_link && theme::button_ex(ui, Look::Secondary, Size::Large, Some(glyph::OPEN), "Open repository", !private, false)
+                .on_hover_text(if private { "Repo link hidden" } else { &url })
                 .clicked()
             {
                 ctx.open_url(egui::OpenUrl::new_tab(&url));
             }
             // The copy button shows a tick for a moment after it copied.
-            let copied = now - self.copied_at < 1.6;
+            let copied = now - app.copied_at < 1.6;
             if copied {
                 ctx.request_repaint_after(Duration::from_millis(100));
             }
             let (icon, tip) = if copied { (glyph::CHECK, "Link copied") } else { (glyph::COPY, "Copy link") };
-            if theme::icon_button(ui, Look::Secondary, Size::Large, icon, tip).clicked() {
+            if p.is_git() && ui.add_enabled_ui(!private, |ui| theme::icon_button(ui, Look::Secondary, Size::Large, icon, tip)).inner.clicked() {
                 ctx.copy_text(url.clone());
-                self.copied_at = now;
+                app.copied_at = now;
             }
+        };
+        if !victory {
+            ui.horizontal_wrapped(|ui| actions(self, ui));
+        } else if graphics_below {
+            ui.horizontal_wrapped(|ui| actions(self, ui));
+            ui.add_space(14.0);
             ui.push_id(&p.repo, |ui| self.project_graphics_menu(ui, &p.repo));
-        });
+        } else {
+            let width = ui.available_width();
+            ui.allocate_ui_with_layout(vec2(width, ACTION_BUTTON_HEIGHT), Layout::left_to_right(Align::Min), |ui| {
+                ui.vertical(|ui| {
+                    let offset = GRAPHICS_BAND_HEIGHT + ui.spacing().item_spacing.y
+                        + (theme::CONTROL_H - ACTION_BUTTON_HEIGHT) / 2.0;
+                    ui.add_space(offset);
+                    ui.horizontal(|ui| actions(self, ui));
+                });
+                ui.add_space(GRAPHICS_GAP);
+                ui.push_id(&p.repo, |ui| self.project_graphics_menu(ui, &p.repo));
+            });
+        }
 
         ui.add_space(8.0);
         if installed {
@@ -567,11 +642,13 @@ impl App {
         let other = job_repo.as_ref().and_then(|r| self.all_projects().into_iter().find(|q| &q.repo == r)).map(|q| q.name);
         ui.horizontal_wrapped(|ui| {
             if this_job {
-                note(ui, &stage);
+                note(ui, if private { short_stage(&stage) } else { &stage });
             } else if running && stage == "Playing" {
                 note(ui, "Close the running game first.");
             } else if running {
-                note(ui, &format!("Waiting for {} to finish.", other.as_deref().unwrap_or("the current job")));
+                note(ui, &format!("Waiting for {} to finish.", if private { "the current job" } else { other.as_deref().unwrap_or("the current job") }));
+            } else if installed && !victory {
+                note(ui, if runnable { "Starts the installed Rust program." } else { "This Rust workspace has no runnable binary." });
             } else if installed && self.files_ok() && self.saved.warm_before_play {
                 note(ui, "Warms up the shaders first, then starts your installed build with your own game files.");
             } else if installed && self.files_ok() {
@@ -603,19 +680,19 @@ impl App {
                 } else {
                     theme::dot(ui, theme::GOOD);
                     let v = st.built.as_deref().map(|c| &c[..c.len().min(7)]).unwrap_or("unknown");
-                    ui.label(RichText::new(format!("Installed, version {v}")).font(theme::regular(13.0)).color(theme::MUTED));
+                let label = if private || p.archive_exe.is_some() { "Installed".into() } else { format!("Installed, version {v}") };
+                    ui.label(RichText::new(label).font(theme::regular(13.0)).color(theme::MUTED));
                 }
                 if p.local_exe.is_none() {
                     ui.add_space(6.0);
-                    if theme::small(ui, Look::Ghost, Some(glyph::SYNC), "Check for updates", !st.checking).clicked() {
+                    if p.is_git() && theme::small(ui, Look::Ghost, Some(glyph::SYNC), "Check for updates", !st.checking).clicked() {
                         self.check_repo(ctx, p);
                     }
-                    let warm = theme::small(ui, Look::Ghost, Some(glyph::WARM), "Warm up shaders", !running && self.files_ok())
-                        .on_hover_text("Translate the game's shaders into this project's cache now, so it does not stop to translate them while you play.");
-                    if warm.clicked() {
+                    if victory && theme::small(ui, Look::Ghost, Some(glyph::WARM), "Warm up shaders", !running && self.files_ok())
+                        .on_hover_text("Translate the game's shaders into this project's cache now, so it does not stop to translate them while you play.").clicked() {
                         self.start(ctx, p.clone(), Kind::Warm);
                     }
-                    if theme::small(ui, Look::Ghost, Some(glyph::REPAIR), "Reinstall", !running).clicked() {
+                    if p.is_git() && theme::small(ui, Look::Ghost, Some(glyph::REPAIR), "Reinstall", !running).clicked() {
                         self.start(ctx, p.clone(), Kind::Install);
                     }
                     if theme::small(ui, Look::Danger, Some(glyph::DELETE), "Uninstall", !running).clicked() {
@@ -633,7 +710,8 @@ impl App {
             ui.add_space(18.0);
             theme::callout(ui, theme::WARN, glyph::SYNC, |ui| {
                 let short = &remote[..remote.len().min(7)];
-                wrapped(ui, &format!("A new version is out: {short}."), theme::WHITE);
+                let label = if self.screenshot_projects.is_some() { "Update available.".into() } else { format!("A new version is out: {short}.") };
+                wrapped(ui, &label, theme::WHITE);
                 ui.horizontal(|ui| {
                     if theme::small(ui, Look::Secondary, Some(glyph::DOWNLOAD), "Update now", !running).clicked() {
                         self.start(ctx, p.clone(), Kind::Install);
@@ -646,6 +724,9 @@ impl App {
             });
         }
 
+        if p.archive_exe.is_some() {
+            return;
+        }
         if p.custom {
             ui.add_space(18.0);
             let mut remove = false;
@@ -711,7 +792,8 @@ impl App {
             // Lines of a readable length, whatever the window's width.
             ui.scope(|ui| {
                 ui.set_max_width(680.0);
-                ui.add(Label::new(RichText::new(&p.summary).font(theme::regular(15.0)).color(theme::BLUSH)).wrap());
+                let summary = if self.screenshot_projects.is_some() { "Project description hidden." } else { &p.summary };
+                ui.add(Label::new(RichText::new(summary).font(theme::regular(15.0)).color(theme::BLUSH)).wrap());
             });
         }
     }
@@ -726,6 +808,7 @@ impl App {
             ctx.data_mut(|data| data.insert_temp(id, selected));
         }
         match tab {
+            1 | 2 if self.screenshot_projects.is_some() => note(ui, "Hidden in Screenshot mode."),
             1 => {
                 ui.add_space(12.0);
                 self.project_notes(ui, project);
@@ -736,7 +819,7 @@ impl App {
             }
             _ => self.page_body(ui, ctx, project),
         }
-        let key = project.repo.to_ascii_lowercase();
+        let key = project_key(&project.repo);
         if self.saved.project_launch.get(&key).is_some_and(|launch| {
             launch.args.is_none() && launch.switches.is_none() && launch.graphics.is_none() && launch.notes.is_empty()
         }) {
@@ -746,30 +829,78 @@ impl App {
 
     fn project_graphics_menu(&mut self, ui: &mut Ui, repo: &str) {
         let default_graphics = self.saved.default_graphics();
-        let key = repo.to_ascii_lowercase();
-        let label = if self.saved.project_launch.get(&key).is_some_and(|launch| launch.graphics.is_some()) {
-            "Graphics · Custom"
-        } else {
-            "Graphics · Default"
-        };
-        ui.menu_button(label, |ui| {
-            ui.set_width(340.0);
-            let launch = self.saved.project_launch.entry(key).or_default();
-            let mut custom = launch.graphics.is_some();
-            if ui.checkbox(&mut custom, "Override default graphics").changed() {
-                launch.graphics = custom.then_some(default_graphics);
+        let key = project_key(repo);
+        let launch = self.saved.project_launch.entry(key).or_default();
+        ui.vertical_centered(|ui| {
+            ui.set_width(PROJECT_GRAPHICS_WIDTH);
+            // Equal space above and below the presets keeps their center aligned
+            // with the neighboring Play button.
+            let band_layout = Layout::top_down(Align::Center).with_main_align(Align::Center);
+            ui.allocate_ui_with_layout(vec2(PROJECT_GRAPHICS_WIDTH, GRAPHICS_BAND_HEIGHT), band_layout, |ui| {
+                ui.set_min_height(GRAPHICS_BAND_HEIGHT);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                theme::caps(ui, "Project graphics", 10.5, theme::LILAC);
+                note(ui, if launch.graphics.is_some() { "Overrides global" } else { "Using global" });
+            });
+            let mut graphics = launch.graphics.unwrap_or(default_graphics);
+            let names = MODES.map(|mode| mode.0);
+            if let Some(index) = theme::segmented(ui, "project-graphics-preset", &names, graphics_mode(graphics), None) {
+                graphics.series_s = MODES[index].1;
+                graphics.render_scale = MODES[index].2;
+                launch.graphics = Some(graphics);
             }
-            if let Some(graphics) = &mut launch.graphics {
-                ui.add_space(12.0);
-                ui.push_id("project-graphics", |ui| graphics_controls(ui, graphics));
-            }
+            ui.allocate_ui_with_layout(vec2(PROJECT_GRAPHICS_WIDTH, GRAPHICS_BAND_HEIGHT), band_layout, |ui| {
+                ui.set_min_height(GRAPHICS_BAND_HEIGHT);
+                let label = if graphics.output == OutputResolution::Default {
+                    "Other graphics settings".into()
+                } else {
+                    format!("Other graphics settings · {}", graphics.output.label())
+                };
+                ui.menu_button(label, |ui| {
+                    ui.set_width(340.0);
+                    let before = graphics;
+                    egui::ComboBox::from_label("Console profile")
+                        .selected_text(if graphics.series_s { "Series S" } else { "Series X" })
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut graphics.series_s, false, "Series X");
+                            ui.selectable_value(&mut graphics.series_s, true, "Series S");
+                        });
+                    egui::ComboBox::from_label("Output resolution")
+                        .selected_text(graphics.output.label())
+                        .show_ui(ui, |ui| {
+                            for output in OutputResolution::OPTIONS {
+                                ui.selectable_value(&mut graphics.output, output, output.label());
+                            }
+                        });
+                    note(ui, "Output resolution requires support in the selected build.");
+                    ui.add_space(8.0);
+                    graphics_options(ui, &mut graphics);
+                    if graphics != before {
+                        launch.graphics = Some(graphics);
+                    }
+                    if launch.graphics.is_some() && ui.button("Use global settings").clicked() {
+                        launch.graphics = None;
+                        ui.close_menu();
+                    }
+                });
+            });
         });
     }
 
     fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {
         let global_args = &self.saved.launch_args;
         let global_switches = &self.saved.extra_env;
-        let launch = self.saved.project_launch.entry(project.repo.to_ascii_lowercase()).or_default();
+        let launch = self.saved.project_launch.entry(project_key(&project.repo)).or_default();
+        if project.runs_standalone() {
+            section(ui, "Program arguments", None, "Passed directly to the program when it starts.", |ui| {
+                let args = launch.args.get_or_insert_with(String::new);
+                theme::field(ui, args, "--example", ui.available_width(), None);
+            });
+            if launch.args.as_deref() == Some("") {
+                launch.args = None;
+            }
+            return;
+        }
         section(ui, "Project launch settings", None, "Applies to this project only. Each field can use its global default or a project-specific value.", |ui| {
             let mut custom_args = launch.args.is_some();
             if ui.checkbox(&mut custom_args, "Use project launch arguments").changed() {
@@ -801,7 +932,7 @@ impl App {
     }
 
     fn project_notes(&mut self, ui: &mut Ui, project: &Project) {
-        let launch = self.saved.project_launch.entry(project.repo.to_ascii_lowercase()).or_default();
+        let launch = self.saved.project_launch.entry(project_key(&project.repo)).or_default();
         section(ui, "Profile notes", None, "Saved locally for this project.", |ui| {
             ui.add(egui::TextEdit::multiline(&mut launch.notes)
                 .hint_text("Record performance, glitches, or settings to try…")
@@ -848,8 +979,39 @@ impl App {
             };
             ui.label(RichText::new(text).font(theme::regular(13.5)).color(color));
         });
-        if has_log && (self.show_log || failed) {
+        if has_log && self.show_log {
             ui.add_space(6.0);
+            let (log, omitted) = {
+                let job = self.job.lock().unwrap();
+                (job.log.join("\n"), job.omitted_log_lines)
+            };
+            ui.horizontal_wrapped(|ui| {
+                let label = if self.log_expanded { "Collapse" } else { "Expand" };
+                if theme::small(ui, Look::Ghost, None, label, true).clicked() {
+                    self.log_expanded = !self.log_expanded;
+                }
+                if theme::small(ui, Look::Ghost, Some(glyph::COPY), "Copy log", true).clicked() {
+                    ui.ctx().copy_text(log.clone());
+                    self.log_export_status = Some(("Log copied.".into(), false));
+                }
+                if theme::small(ui, Look::Ghost, None, "Export log…", true).clicked() {
+                    if let Some(path) = rfd::FileDialog::new().set_title("Export Activity log")
+                        .set_file_name("mandyhub.log").save_file()
+                    {
+                        self.log_export_status = Some(match std::fs::write(path, &log) {
+                            Ok(()) => ("Log exported.".into(), false),
+                            Err(error) => (format!("Could not export the log: {error}"), true),
+                        });
+                    }
+                }
+            });
+            if let Some((message, error)) = &self.log_export_status {
+                wrapped(ui, message, if *error { theme::BAD } else { theme::MUTED });
+            }
+            if omitted > 0 {
+                note(ui, &format!("{omitted} earlier lines have scrolled out of the log buffer."));
+            }
+            let height = if self.log_expanded { (ui.ctx().screen_rect().height() - 190.0).max(320.0) } else { 240.0 };
             Frame::none()
                 .fill(theme::DEEP)
                 .stroke(Stroke::new(1.0, theme::LINE))
@@ -857,21 +1019,16 @@ impl App {
                 .inner_margin(Margin::same(14.0))
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    egui::ScrollArea::vertical().id_salt("log").max_height(240.0).stick_to_bottom(true).auto_shrink([false, true]).show(
+                    egui::ScrollArea::vertical().id_salt("log").max_height(height).stick_to_bottom(true).auto_shrink([false, true]).show(
                         ui,
                         |ui| {
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            let j = self.job.lock().unwrap();
-                            for line in j.log.iter().rev().take(400).rev() {
-                                let color = if line.starts_with("ERROR") {
-                                    theme::BAD
-                                } else if line.starts_with("== ") {
-                                    theme::WHITE
-                                } else {
-                                    theme::FAINT
-                                };
-                                ui.add(Label::new(RichText::new(line).font(theme::mono(12.0)).color(color)).wrap());
-                            }
+                            let mut text = log.as_str();
+                            ui.add(egui::TextEdit::multiline(&mut text)
+                                .id_salt("activity-log-text")
+                                .font(theme::mono(12.0))
+                                .desired_width(f32::INFINITY)
+                                .desired_rows(1)
+                                .frame(false));
                         },
                     );
                 });
@@ -889,6 +1046,10 @@ impl App {
                 theme::caps(ui, "Mandyhub", 11.5, theme::LILAC);
                 theme::title(ui, "Settings", 64.0, col);
                 ui.add_space(18.0);
+                if self.screenshot_projects.is_some() {
+                    note(ui, "Settings are hidden in Screenshot mode.");
+                    return;
+                }
                 self.game_files_card(ui, ctx);
                 ui.add_space(16.0);
                 self.graphics_card(ui);
@@ -1074,8 +1235,11 @@ impl App {
     }
 
     fn about_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        self.updater.poll();
+        self.credits_card(ui);
+        ui.add_space(14.0);
         use crate::updater::{State, RELEASES};
+        let busy = self.job.lock().unwrap().running;
+        let card_start = ui.next_widget_position();
         section(ui, "Launcher updates", None, concat!("Mandyhub ", env!("CARGO_PKG_VERSION")), |ui| {
             match &self.updater.state {
                 State::Idle => {}
@@ -1083,36 +1247,55 @@ impl App {
                 State::Current => note(ui, "You’re on the latest release."),
                 State::Available(release) => note(ui, &format!("{} is available.", release.tag_name)),
                 State::Downloading => note(ui, "Downloading and verifying the update…"),
-                State::Downloaded(path) => {
-                    wrapped(ui, "Update ready. Close this launcher, then open Mandyhub.exe from the download folder.", theme::BLUSH);
-                    if theme::button(ui, Look::Secondary, Some(glyph::FOLDER), "Open download folder").clicked() {
-                        if let Some(folder) = path.parent() {
-                            let _ = std::process::Command::new("explorer").arg(folder).spawn();
-                        }
+                State::Downloaded(update) => {
+                    if let Some(error) = &self.updater.restart_error {
+                        wrapped(ui, error, theme::BAD);
+                    } else {
+                        wrapped(ui, "Verified update ready.", theme::BLUSH);
                     }
+                    ui.horizontal_wrapped(|ui| {
+                        if theme::button_ex(ui, Look::Primary, Size::Normal, Some(glyph::SYNC), "Restart to apply", !busy, false).clicked() {
+                            self.updater.restart_requested = true;
+                        }
+                        if theme::button(ui, Look::Secondary, Some(glyph::FOLDER), "Open download folder").clicked() {
+                            if let Some(folder) = update.path.parent() {
+                                let _ = std::process::Command::new("explorer").arg(folder).spawn();
+                            }
+                        }
+                    });
                 }
                 State::Failed(error) => wrapped(ui, error, theme::BAD),
             }
             ui.horizontal_wrapped(|ui| {
                 match self.updater.state {
                     State::Available(_) => {
-                        if theme::button(ui, Look::Primary, Some(glyph::DOWNLOAD), "Download update").clicked() {
+                        if theme::button_ex(ui, Look::Primary, Size::Normal, Some(glyph::DOWNLOAD), "Update and restart", !busy, false).clicked() {
                             self.updater.download(ctx);
                         }
                     }
-                    State::Checking | State::Downloading => {}
-                    _ => {
-                        if theme::button(ui, Look::Secondary, Some(glyph::SYNC), "Check for updates").clicked() {
-                            self.updater.check(ctx);
-                        }
-                    }
+                    _ => {}
+                }
+                let ready = !matches!(self.updater.state, State::Checking | State::Downloading);
+                if theme::button_ex(ui, Look::Secondary, Size::Normal, Some(glyph::SYNC), "Check for update", ready, false).clicked() {
+                    self.updater.check(ctx);
                 }
                 if theme::button(ui, Look::Ghost, Some(glyph::OPEN), "Release notes").clicked() {
                     ctx.open_url(egui::OpenUrl::new_tab(RELEASES));
                 }
             });
         });
-        ui.add_space(14.0);
+        let scroll = ctx.data_mut(|data| data.remove_temp::<bool>(egui::Id::new("scroll-to-launcher-updates")));
+        if scroll.unwrap_or(false) {
+            ui.scroll_to_rect(egui::Rect::from_two_pos(card_start, ui.next_widget_position()), Some(Align::BOTTOM));
+        }
+    }
+
+    fn open_launcher_updates(&mut self, ctx: &egui::Context) {
+        self.view = View::Settings;
+        ctx.data_mut(|data| data.insert_temp(egui::Id::new("scroll-to-launcher-updates"), true));
+    }
+
+    fn credits_card(&self, ui: &mut Ui) {
         section(ui, "About Mandyhub", None, "", |ui| {
             wrapped(
                 ui,
@@ -1131,7 +1314,7 @@ impl App {
             wrapped(ui, "Display type: Josefin Sans and Big Shoulders Display, under the SIL Open Font License.", theme::FAINT);
             ui.add_space(10.0);
             if theme::button(ui, Look::Secondary, Some(glyph::OPEN), "Open portwatch-vi.xyz").clicked() {
-                ctx.open_url(egui::OpenUrl::new_tab("https://portwatch-vi.xyz"));
+                ui.ctx().open_url(egui::OpenUrl::new_tab("https://portwatch-vi.xyz"));
             }
         });
     }
@@ -1139,7 +1322,11 @@ impl App {
     /// The open dialog, if any: add a repo, uninstall, or move the install folder.
     fn dialogs(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
-        let open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some() || self.save_picker.is_some();
+        let (running, import_error) = {
+            let job = self.job.lock().unwrap();
+            (job.running, job.import_error.clone())
+        };
+        let open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some() || self.save_picker.is_some() || import_error.is_some();
         if open && !self.modal_was_open {
             self.modal_at = now;
         }
@@ -1147,8 +1334,8 @@ impl App {
         let t0 = self.modal_at;
 
         if let Some(mut picker) = self.save_picker.take() {
-            let running = self.job.lock().unwrap().running;
-            let (action, dismissed) = picker.show(ctx, t0, !running && self.files_ok());
+            let alias = self.screenshot_alias(&picker.project.repo).map(|(name, _)| name);
+            let (action, dismissed) = picker.show(ctx, t0, !running && self.files_ok(), alias.as_deref());
             match action {
                 save_picker::Action::Launch(choice) if !dismissed => self.start(ctx, picker.project, Kind::Play(choice)),
                 save_picker::Action::Keep if !dismissed => self.save_picker = Some(picker),
@@ -1160,11 +1347,11 @@ impl App {
             let mut keep = true;
             let (_, dismissed) = theme::modal(ctx, "add-repo", t0, 460.0, |ui| {
                 theme::caps(ui, "Custom repo", 11.5, theme::LILAC);
-                theme::title(ui, "Add a repo by link", 40.0, 460.0);
-                note(ui, "Paste the GitHub link of a VIctory-based project.");
+                theme::title(ui, "Import Repo/Zip", 40.0, 460.0);
+                note(ui, "Add a Rust project by Git URL or import a prebuilt ZIP.");
                 ui.add_space(14.0);
                 let w = ui.available_width();
-                let field = theme::field(ui, &mut add.link, "github.com/owner/name", w, Some(glyph::LINK));
+                let field = theme::field(ui, &mut add.link, "https://git.example.com/owner/project.git", w, Some(glyph::LINK));
                 if add.focus {
                     field.request_focus();
                     add.focus = false;
@@ -1188,20 +1375,26 @@ impl App {
                 ui.add_space(20.0);
                 button_row(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    if theme::button(ui, Look::Primary, Some(glyph::ADD), "Add repo").clicked() {
+                    if theme::button(ui, Look::Primary, Some(glyph::ADD), "Import repo link").clicked() {
                         submit = true;
+                    }
+                    if theme::small(ui, Look::Secondary, Some(glyph::FOLDER), "Import build ZIP…", !running).clicked() {
+                        if let Some(path) = rfd::FileDialog::new().add_filter("Build ZIP", &["zip"]).pick_file() {
+                            self.import_build_zip(ctx, path);
+                            keep = false;
+                        }
                     }
                     if theme::button(ui, Look::Ghost, None, "Cancel").clicked() {
                         keep = false;
                     }
                 });
                 if submit {
-                    match parse_repo(&add.link) {
+                    match parse_git_repo(&add.link) {
                         Some(repo) => {
                             self.add_custom(repo);
                             keep = false;
                         }
-                        None => add.error = Some("That is not a GitHub repo link. Paste one like github.com/owner/name.".into()),
+                        None => add.error = Some("Enter an HTTPS, HTTP, SSH, or Git clone URL without embedded credentials.".into()),
                     }
                 }
             });
@@ -1210,9 +1403,21 @@ impl App {
             }
         }
 
+        if let Some(error) = import_error {
+            let (close, dismissed) = theme::modal(ctx, "zip-import-error", t0, 440.0, |ui| {
+                theme::title(ui, "Build import failed", 34.0, 440.0);
+                wrapped(ui, &error, theme::BAD);
+                theme::button(ui, Look::Primary, None, "Close").clicked()
+            });
+            if close || dismissed {
+                self.job.lock().unwrap().import_error = None;
+            }
+        }
+
         if let Some(repo) = self.confirm_uninstall.clone() {
             let project = self.all_projects().into_iter().find(|p| p.repo == repo);
-            let name = project.as_ref().map_or_else(|| repo.clone(), |p| p.name.clone());
+            let name = self.screenshot_alias(&repo).map(|(name, _)| name)
+                .unwrap_or_else(|| project.as_ref().map_or_else(|| repo.clone(), |p| p.name.clone()));
             let mut close = false;
             let (_, dismissed) = theme::modal(ctx, "uninstall", t0, 440.0, |ui| {
                 theme::caps(ui, "Uninstall", 11.5, theme::BAD);
@@ -1290,7 +1495,7 @@ impl App {
 
     /// Puts a repo added by link at the top of the list and opens its page.
     fn add_custom(&mut self, repo: String) {
-        let name = repo.split('/').next_back().unwrap_or(&repo).to_string();
+        let name = repo.split('/').next_back().unwrap_or(&repo).trim_end_matches(".git").to_string();
         self.saved.custom.retain(|p| p.repo != repo);
         self.saved.custom.insert(
             0,
@@ -1305,6 +1510,7 @@ impl App {
                 summary: String::new(),
                 custom: true,
                 local_exe: None,
+                archive_exe: None,
             },
         );
         self.saved.selected = Some(repo);

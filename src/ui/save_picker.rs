@@ -1,4 +1,5 @@
 use super::{button_row, note, wrapped};
+use crate::save_zip;
 use crate::saves::{self, LaunchSave};
 use crate::theme::{self, glyph, Look, Size};
 use crate::{slug, workspace, Project};
@@ -37,6 +38,8 @@ pub(crate) struct SavePicker {
     naming: Option<String>,
     focus_name: bool,
     error: Option<String>,
+    transfer_status: Option<Result<String, String>>,
+    pending_delete: Option<(String, PathBuf)>,
 }
 
 impl SaveOption {
@@ -130,6 +133,8 @@ impl SavePicker {
             naming: None,
             focus_name: false,
             error: None,
+            transfer_status: None,
+            pending_delete: None,
         }
     }
 
@@ -138,11 +143,84 @@ impl SavePicker {
         ctx: &egui::Context,
         opened_at: f64,
         can_play: bool,
+        screenshot_name: Option<&str>,
     ) -> (Action, bool) {
         theme::modal(ctx, "save-picker", opened_at, 540.0, |ui| {
-            theme::caps(ui, &self.project.name, 11.5, theme::LILAC);
+            let screenshot = screenshot_name.is_some();
+            theme::caps(
+                ui,
+                screenshot_name.unwrap_or(&self.project.name),
+                11.5,
+                theme::LILAC,
+            );
             theme::title(ui, "Choose a save", 40.0, 540.0);
+            if let Some((name, path)) = &self.pending_delete {
+                wrapped(
+                    ui,
+                    &format!(
+                        "Delete {name}? The files will move to Mandyhub’s deleted-saves folder."
+                    ),
+                    theme::BLUSH,
+                );
+                let mut confirm = false;
+                let mut cancel = false;
+                button_row(ui, |ui| {
+                    confirm =
+                        theme::button(ui, Look::DangerSolid, Some(glyph::DELETE), "Delete save")
+                            .clicked();
+                    cancel = theme::button(ui, Look::Ghost, None, "Cancel").clicked();
+                });
+                if confirm {
+                    match saves::delete_save(&workspace(), path) {
+                        Ok(_) => {
+                            let tab = self.tab;
+                            *self = Self::new(self.project.clone());
+                            self.tab = tab;
+                            self.transfer_status = Some(Ok("Save moved to deleted-saves.".into()));
+                        }
+                        Err(error) => {
+                            self.pending_delete = None;
+                            self.transfer_status =
+                                Some(Err(format!("Could not delete save: {error}")));
+                        }
+                    }
+                } else if cancel {
+                    self.pending_delete = None;
+                }
+                return Action::Keep;
+            }
             note(ui, "Choose where to start. Fresh games and copied saves keep your earlier progress available.");
+            if theme::small(
+                ui,
+                Look::Secondary,
+                Some(glyph::ADD),
+                "Import save ZIP",
+                !screenshot,
+            )
+            .clicked()
+            {
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("VIctory save ZIP", &["zip"])
+                    .pick_file()
+                {
+                    self.transfer_status =
+                        Some(match save_zip::import(&self.checkpoint_root, &path) {
+                            Ok((name, path)) => {
+                                let checkpoint = SaveOption::favorite(name.clone(), path);
+                                let index = self
+                                    .favorites
+                                    .partition_point(|option| option.title < checkpoint.title);
+                                self.favorites.insert(index, checkpoint);
+                                self.tab = Tab::Favorites;
+                                self.selected = index;
+                                self.naming = None;
+                                self.error = None;
+                                Ok(format!("Imported “{name}” into Favorites."))
+                            }
+                            Err(error) => Err(format!("Could not import save: {error}")),
+                        });
+                }
+            }
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 for (tab, label) in [
@@ -191,7 +269,13 @@ impl SavePicker {
                         wrapped(ui, empty, theme::FAINT);
                     }
                     for (index, option) in options.iter().enumerate() {
-                        if save_row(ui, option, selected == index) {
+                        let alias = (screenshot && self.tab != Tab::ThisBuild)
+                            .then(|| format!("Example save {:02}", index + 1));
+                        if save_row(
+                            ui,
+                            alias.as_deref().unwrap_or(&option.title),
+                            selected == index,
+                        ) {
                             selected = index;
                         }
                     }
@@ -208,6 +292,64 @@ impl SavePicker {
             if let Some(option) = options.get(selected) {
                 ui.add_space(4.0);
                 note(ui, option.detail);
+            }
+            let export_source = match &choice {
+                Some(LaunchSave::Copy(path)) => Some(path.as_path()),
+                _ => source.as_deref(),
+            };
+            if let Some(path) = export_source.filter(|_| !screenshot) {
+                ui.horizontal_wrapped(|ui| {
+                    if theme::small(
+                        ui,
+                        Look::Ghost,
+                        Some(glyph::OPEN),
+                        "Export selected save",
+                        true,
+                    )
+                    .clicked()
+                    {
+                        if let Some(destination) = rfd::FileDialog::new()
+                            .add_filter("ZIP archive", &["zip"])
+                            .set_file_name("Mandyhub Save.zip")
+                            .save_file()
+                        {
+                            let destination = if destination.extension().is_none() {
+                                destination.with_extension("zip")
+                            } else {
+                                destination
+                            };
+                            self.transfer_status = Some(
+                                save_zip::export(path, &destination)
+                                    .map(|()| format!("Exported to {}.", destination.display()))
+                                    .map_err(|error| format!("Could not export save: {error}")),
+                            );
+                        }
+                    }
+                    if theme::small(
+                        ui,
+                        Look::Danger,
+                        Some(glyph::DELETE),
+                        "Delete selected save",
+                        true,
+                    )
+                    .clicked()
+                    {
+                        if let Some(option) = options.get(selected) {
+                            let name = if option.choice == LaunchSave::Continue {
+                                format!("the active save for {}", self.project.name)
+                            } else {
+                                format!("“{}”", option.title)
+                            };
+                            self.pending_delete = Some((name, path.to_owned()));
+                        }
+                    }
+                });
+            }
+            if let Some(status) = &self.transfer_status {
+                match status {
+                    Ok(message) => wrapped(ui, message, theme::GOOD),
+                    Err(error) => wrapped(ui, error, theme::BAD),
+                }
             }
             if let (Some(name), Some(source)) = (&mut self.naming, &source) {
                 ui.add_space(10.0);
@@ -294,6 +436,7 @@ impl SavePicker {
                     action = Action::Cancel;
                 }
                 if source.is_some()
+                    && !screenshot
                     && theme::button(ui, Look::Secondary, Some(glyph::ADD), "Add to favorites")
                         .clicked()
                 {
@@ -306,14 +449,10 @@ impl SavePicker {
     }
 }
 
-fn save_row(ui: &mut Ui, option: &SaveOption, selected: bool) -> bool {
-    let title = RichText::new(format!(
-        "{}  {}",
-        if selected { "●" } else { "○" },
-        option.title
-    ))
-    .font(theme::regular(15.0))
-    .color(theme::WHITE);
+fn save_row(ui: &mut Ui, name: &str, selected: bool) -> bool {
+    let title = RichText::new(format!("{}  {}", if selected { "●" } else { "○" }, name))
+        .font(theme::regular(15.0))
+        .color(theme::WHITE);
     let row = egui::Button::new(title)
         .min_size(vec2(ui.available_width(), 34.0))
         .fill(if selected {
