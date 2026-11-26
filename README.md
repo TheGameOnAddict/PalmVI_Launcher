@@ -6,6 +6,7 @@ A community launcher for VIctory-based projects.
 - **Custom repo links:** add any GitHub repo by its link.
 - **Install once, play many times:** a project is downloaded and built on your PC once and stays installed.
 - **Updates:** installed projects are checked for new versions at start and every 15 minutes; an update can be installed now or later.
+- **Install folder:** choose where projects are downloaded and built (a big drive is best); installed projects can be moved there.
 - **Uninstall:** removes a project's download, build and shader cache (saves stay).
 - **Game files check:** Play stays off until the folder with your own game files is chosen.
 - **Fullscreen:** optional borderless fullscreen for the game window.

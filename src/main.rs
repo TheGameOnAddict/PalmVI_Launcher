@@ -78,6 +78,8 @@ struct Saved {
     defaults_set: bool,
     /// Play in borderless fullscreen (off: a normal window). Off by default.
     fullscreen: bool,
+    /// Where projects are downloaded and built (empty: the default folder).
+    install_dir: String,
     /// Updates put off with "Later": (repo, the new version's commit).
     later: Vec<(String, String)>,
     selected: Option<String>,
@@ -109,6 +111,8 @@ struct App {
     confirm_custom: Option<String>,
     /// The project an uninstall is being confirmed for.
     confirm_uninstall: Option<String>,
+    /// A new install folder waiting for "move the projects there?" (from, to).
+    pending_move: Option<(PathBuf, PathBuf)>,
     /// The folder the files were checked in was empty.
     empty: bool,
     /// The drive search: `None` idle, `Some(None)` searching, `Some(Some(r))` done.
@@ -258,8 +262,60 @@ fn main() -> eframe::Result<()> {
 
 /// Where the launcher keeps repos it downloads: `%LOCALAPPDATA%\Mandyhub`.
 fn workspace() -> PathBuf {
+    INSTALL_DIR.lock().unwrap().clone().unwrap_or_else(default_workspace)
+}
+
+/// `%LOCALAPPDATA%\Mandyhub`: where projects go unless the player chose
+/// another folder (Settings: Install folder).
+fn default_workspace() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
     base.join("Mandyhub")
+}
+
+/// The install folder the player chose, if any.
+static INSTALL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn set_install_dir(dir: &str) {
+    let d = dir.trim();
+    *INSTALL_DIR.lock().unwrap() = (!d.is_empty()).then(|| PathBuf::from(d));
+}
+
+/// The parts of an install folder that belong to projects.
+const PROJECT_PARTS: &[&str] = &["repos", "target", "cache", "data"];
+
+/// Whether `dir` holds any installed project.
+fn has_projects(dir: &Path) -> bool {
+    std::fs::read_dir(dir.join("repos")).map(|mut d| d.next().is_some()).unwrap_or(false)
+}
+
+/// Moves a folder: a rename on the same drive, else a copy and a delete.
+fn move_dir(from: &Path, to: &Path, log: &dyn Fn(String)) -> std::io::Result<()> {
+    if !from.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = to.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    if !to.exists() && std::fs::rename(from, to).is_ok() {
+        return Ok(());
+    }
+    copy_dir(from, to, log)?;
+    std::fs::remove_dir_all(from)
+}
+
+fn copy_dir(from: &Path, to: &Path, log: &dyn Fn(String)) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let target = to.join(e.file_name());
+        if e.file_type()?.is_dir() {
+            copy_dir(&e.path(), &target, log)?;
+        } else {
+            std::fs::copy(e.path(), &target)?;
+        }
+    }
+    log(format!("copied {}", from.display()));
+    Ok(())
 }
 
 /// The launcher's folders had another name before: they are moved once, so
@@ -393,6 +449,7 @@ impl App {
             tools: None,
             confirm_custom: None,
             confirm_uninstall: None,
+            pending_move: None,
             empty: false,
             finding: Arc::new(Mutex::new(None)),
             repos: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -409,6 +466,7 @@ impl App {
             app.saved.series_s = true;
             app.saved.render_scale = 0.5;
         }
+        set_install_dir(&app.saved.install_dir);
         app.refresh_projects(&cc.egui_ctx);
         let ctx = cc.egui_ctx.clone();
         let job = app.job.clone();
@@ -843,6 +901,38 @@ impl eframe::App for App {
             }
         }
 
+        if let Some((old, new)) = self.pending_move.clone() {
+            let mut open = true;
+            egui::Window::new(RichText::new("Move installed projects?").strong().size(18.0))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .open(&mut open)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(format!("New install folder:\n{}", new.display())).color(Color32::WHITE));
+                    ui.label(RichText::new("Your installed projects (and their saves) are in the old folder. Move them to the new one? Moving to another drive can take a while.").color(DIM));
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let b = egui::Button::new(RichText::new("Move them").color(Color32::WHITE)).fill(look::CORAL);
+                        if ui.add(b).clicked() {
+                            self.apply_install_dir(&new);
+                            self.start_move(ctx, old.clone(), new.clone());
+                            self.pending_move = None;
+                        }
+                        if ui.button("Don't move").clicked() {
+                            self.apply_install_dir(&new);
+                            self.pending_move = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            self.pending_move = None;
+                        }
+                    });
+                });
+            if !open {
+                self.pending_move = None;
+            }
+        }
+
         if let Some(repo) = self.confirm_uninstall.clone() {
             let name = self.all_projects().into_iter().find(|p| p.repo == repo);
             let mut open = true;
@@ -1014,6 +1104,66 @@ impl App {
             if let Some(r) = remove {
                 self.saved.custom.retain(|p| p.repo != r);
             }
+        });
+    }
+
+    /// A new install folder: asks first if projects are installed in the old one.
+    fn choose_install_dir(&mut self, new: PathBuf) {
+        let old = workspace();
+        if new == old {
+            return;
+        }
+        if has_projects(&old) {
+            self.pending_move = Some((old, new));
+        } else {
+            self.apply_install_dir(&new);
+        }
+    }
+
+    fn apply_install_dir(&mut self, new: &Path) {
+        self.saved.install_dir = if new == default_workspace() { String::new() } else { new.display().to_string() };
+        set_install_dir(&self.saved.install_dir);
+        // What is installed where is looked at again.
+        self.repos.lock().unwrap().clear();
+        self.last_auto_check = -1.0;
+    }
+
+    /// Moves every installed project from `old` to `new`, then uses `new`.
+    fn start_move(&mut self, ctx: &egui::Context, old: PathBuf, new: PathBuf) {
+        let job = self.job.clone();
+        {
+            let mut j = job.lock().unwrap();
+            if j.running {
+                return;
+            }
+            *j = Job { running: true, stage: "Moving installed projects".into(), ..Default::default() };
+        }
+        let (ctx, repos) = (ctx.clone(), self.repos.clone());
+        std::thread::spawn(move || {
+            let log = |line: String| {
+                job.lock().unwrap().log.push(line);
+                ctx.request_repaint();
+            };
+            let mut result = Ok(());
+            for part in PROJECT_PARTS {
+                log(format!("moving {}", old.join(part).display()));
+                if let Err(e) = move_dir(&old.join(part), &new.join(part), &log) {
+                    result = Err(format!("could not move {}: {e}", old.join(part).display()));
+                    break;
+                }
+            }
+            let mut j = job.lock().unwrap();
+            j.running = false;
+            match result {
+                Ok(()) => j.stage = "Moved: projects are in the new folder".into(),
+                Err(e) => {
+                    j.failed = true;
+                    j.stage = "Failed".into();
+                    j.log.push(format!("ERROR: {e}"));
+                }
+            }
+            repos.lock().unwrap().clear();
+            ctx.request_repaint();
         });
     }
 
@@ -1336,6 +1486,25 @@ impl App {
         });
         ui.add_space(10.0);
         ui.checkbox(&mut self.saved.fullscreen, RichText::new("Fullscreen").strong());
+        ui.add_space(10.0);
+        let running = self.job.lock().unwrap().running;
+        ui.horizontal(|ui| {
+            ui.label(RichText::new("Install folder").strong());
+            ui.label(RichText::new(workspace().display().to_string()).color(DIM));
+        });
+        ui.horizontal(|ui| {
+            let browse = ui.add_enabled(!running, egui::Button::new("Browse…"));
+            if browse.clicked() {
+                if let Some(d) = rfd::FileDialog::new().set_title("Where projects are downloaded and built").pick_folder() {
+                    self.choose_install_dir(d.join("Mandyhub"));
+                }
+            }
+            let default = ui.add_enabled(!running && !self.saved.install_dir.is_empty(), egui::Button::new("Default"));
+            if default.clicked() {
+                self.choose_install_dir(default_workspace());
+            }
+            ui.label(RichText::new("Projects take several GB each: a big drive is best.").color(DIM).size(13.0));
+        });
         egui::CollapsingHeader::new(RichText::new("Advanced").color(DIM)).show(ui, |ui| {
             ui.label(RichText::new("Extra switches for experts, one per line (VICTORY_NAME=value)").color(DIM));
             ui.add(egui::TextEdit::multiline(&mut self.saved.extra_env).desired_rows(2).desired_width(500.0));
