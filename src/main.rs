@@ -14,6 +14,7 @@ mod design;
 mod slides;
 mod look;
 mod fullscreen;
+mod tools;
 
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
@@ -109,7 +110,7 @@ struct App {
     custom_error: Option<String>,
     files: Vec<(&'static str, bool)>,
     files_for: String,
-    tools: Option<(bool, bool)>,
+    tools: Option<tools::Tools>,
     confirm_custom: Option<String>,
     /// The project an uninstall is being confirmed for.
     confirm_uninstall: Option<String>,
@@ -174,7 +175,7 @@ fn built_file(repo: &str) -> PathBuf {
 /// The newest commit of `p`'s branch online (`git ls-remote`, no download).
 fn remote_head(p: &Project) -> Option<String> {
     let url = format!("https://github.com/{}.git", p.repo);
-    let mut c = Command::new("git");
+    let mut c = tools::git();
     c.arg("ls-remote").arg(&url);
     match &p.branch {
         Some(b) => c.arg(format!("refs/heads/{b}")),
@@ -416,22 +417,14 @@ fn fetch_portwatch() -> Result<Vec<Project>, String> {
     Ok(out)
 }
 
-/// Whether a program answers on the PATH.
-fn has_tool(name: &str, arg: &str) -> bool {
-    let mut c = Command::new(name);
-    c.arg(arg).stdout(Stdio::null()).stderr(Stdio::null());
-    hide_window(&mut c);
-    c.status().map(|s| s.success()).unwrap_or(false)
-}
-
 #[cfg(windows)]
-fn hide_window(c: &mut Command) {
+pub(crate) fn hide_window(c: &mut Command) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     c.creation_flags(CREATE_NO_WINDOW);
 }
 #[cfg(not(windows))]
-fn hide_window(_: &mut Command) {}
+pub(crate) fn hide_window(_: &mut Command) {}
 
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> App {
@@ -473,9 +466,8 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         let job = app.job.clone();
         std::thread::spawn(move || {
-            let tools = (has_tool("git", "--version"), has_tool("cargo", "--version"));
+            let _ = tools::detect();
             job.lock().unwrap().stage = String::new();
-            TOOLS.lock().unwrap().replace(tools);
             ctx.request_repaint();
         });
         app
@@ -636,7 +628,6 @@ impl App {
     }
 }
 
-static TOOLS: Mutex<Option<(bool, bool)>> = Mutex::new(None);
 
 fn stage(job: &Arc<Mutex<Job>>, ctx: &egui::Context, s: &str) {
     let mut j = job.lock().unwrap();
@@ -655,11 +646,11 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<()
     if dir.join(".git").is_dir() {
         stage(job, ctx, "Downloading the new version");
         let refspec = p.branch.clone().unwrap_or_else(|| "HEAD".into());
-        run(job, ctx, Command::new("git").args(["fetch", "--depth", "1", "origin", &refspec]).current_dir(&dir))?;
-        run(job, ctx, Command::new("git").args(["reset", "--hard", "FETCH_HEAD"]).current_dir(&dir))?;
+        run(job, ctx, tools::git().args(["fetch", "--depth", "1", "origin", &refspec]).current_dir(&dir))?;
+        run(job, ctx, tools::git().args(["reset", "--hard", "FETCH_HEAD"]).current_dir(&dir))?;
     } else {
         stage(job, ctx, "Downloading the project");
-        let mut c = Command::new("git");
+        let mut c = tools::git();
         c.args(["clone", "--depth", "1"]);
         if let Some(b) = &p.branch {
             c.args(["--branch", b]);
@@ -672,7 +663,7 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<()
     run(
         job,
         ctx,
-        Command::new("cargo")
+        tools::cargo()
             .args(["build", "--release", "-p", "victory", "--target-dir"])
             .arg(&target)
             .current_dir(&dir),
@@ -680,7 +671,7 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<()
     if !built_exe(&p.repo).is_file() {
         return Err(format!("the build made no {}", built_exe(&p.repo).display()));
     }
-    let mut c = Command::new("git");
+    let mut c = tools::git();
     c.args(["rev-parse", "HEAD"]).current_dir(&dir);
     hide_window(&mut c);
     if let Ok(out) = c.output() {
@@ -824,9 +815,9 @@ impl eframe::App for App {
     }
 
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if self.tools.is_none() {
-            self.tools = *TOOLS.lock().unwrap();
-        }
+        // What the last look found (a look runs at start, after "Check
+        // again" and after the tools were installed).
+        self.tools = tools::current();
         self.check_files();
         let playing = {
             let j = self.job.lock().unwrap();
@@ -1128,6 +1119,83 @@ impl App {
             if let Some(r) = remove {
                 self.saved.custom.retain(|p| p.repo != r);
             }
+        });
+    }
+
+    /// When Git, Rust or the C++ build tools are missing: what is missing,
+    /// "Install missing tools" (winget) and "Check again".
+    fn tools_row(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(t) = self.tools.clone() else { return };
+        if t.ready() {
+            return;
+        }
+        let running = self.job.lock().unwrap().running;
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("To install projects you need:").color(look::GOLD).strong());
+            for m in t.missing() {
+                chip(ui, m, BAD);
+            }
+            let b = egui::Button::new(RichText::new("Install missing tools for me").color(Color32::WHITE)).fill(look::CORAL);
+            if ui.add_enabled(!running, b).clicked() {
+                self.start_tools(ctx);
+            }
+            if ui.add_enabled(!running, egui::Button::new("Check again")).clicked() {
+                self.tools = None;
+                let ctx = ctx.clone();
+                std::thread::spawn(move || {
+                    let _ = tools::detect();
+                    ctx.request_repaint();
+                });
+            }
+        });
+        ui.add_space(4.0);
+    }
+
+    /// Installs what is missing with winget, then looks again.
+    fn start_tools(&mut self, ctx: &egui::Context) {
+        let job = self.job.clone();
+        {
+            let mut j = job.lock().unwrap();
+            if j.running {
+                return;
+            }
+            *j = Job { running: true, stage: "Installing tools (Windows will ask for permission)".into(), ..Default::default() };
+        }
+        self.show_log = true;
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let have = tools::detect();
+            let result = if !tools::has_winget() {
+                Err("winget (the Windows package manager) is not on this PC. Install them by hand: git-scm.com, rustup.rs and the Visual Studio Build Tools (Desktop development with C++).".to_string())
+            } else {
+                let mut r = Ok(());
+                for (what, args) in tools::install_steps(&have) {
+                    stage(&job, &ctx, &format!("Installing {what} (this can take a while)"));
+                    let mut c = Command::new("winget");
+                    c.args(&args);
+                    if let Err(e) = run(&job, &ctx, &mut c) {
+                        r = Err(format!("{what}: {e}"));
+                        break;
+                    }
+                }
+                r
+            };
+            let now = tools::detect();
+            let mut j = job.lock().unwrap();
+            j.running = false;
+            match result {
+                Ok(()) if now.ready() => j.stage = "Tools installed: ready to install projects".into(),
+                Ok(()) => {
+                    j.failed = true;
+                    j.stage = format!("Still missing: {}. A restart of Windows can help.", now.missing().join(", "));
+                }
+                Err(e) => {
+                    j.failed = true;
+                    j.stage = "Tools not installed (see the log)".into();
+                    j.log.push(format!("ERROR: {e}"));
+                }
+            }
+            ctx.request_repaint();
         });
     }
 
@@ -1466,18 +1534,8 @@ impl App {
                     }
                 }
             }
-            match self.tools {
-                Some((git, cargo)) => {
-                    if !git {
-                        chip(ui, "Git is not installed", BAD);
-                    }
-                    if !cargo {
-                        chip(ui, "Rust (cargo) is not installed", BAD);
-                    }
-                }
-                None => {
-                    ui.label(RichText::new("checking tools…").color(DIM));
-                }
+            if self.tools.is_none() {
+                ui.label(RichText::new("checking tools…").color(DIM));
             }
         });
         ui.add_space(18.0);
@@ -1570,7 +1628,8 @@ impl App {
             });
         });
         ui.add_space(6.0);
-        let tools_ok = self.tools.is_some_and(|(g, c)| g && c);
+        self.tools_row(ui, ctx);
+        let tools_ok = self.tools.as_ref().is_some_and(|t| t.ready());
         let running = self.job.lock().unwrap().running;
         let selected = self.selected_project();
         let installed = selected.as_ref().and_then(|p| self.state_of(&p.repo)).is_some_and(|st| st.installed);
@@ -1595,7 +1654,7 @@ impl App {
             } else if installed && !self.files_ok() {
                 "The game files are missing."
             } else if !installed && !tools_ok {
-                "Installing needs Git and Rust (git-scm.com, rustup.rs)."
+                "Installing a project needs Git, Rust and the C++ build tools: press Install missing tools."
             } else if installed {
                 "Starts the installed build. No game files are downloaded."
             } else {

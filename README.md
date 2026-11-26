@@ -16,7 +16,7 @@ No game files are included or downloaded. You need your own copy of the game.
 ## Requirements
 
 - Windows 10 or 11, 64-bit
-- [Git](https://git-scm.com) and [Rust](https://rustup.rs) with the MSVC build tools (to build projects)
+- To build projects: Git, Rust and the C++ build tools. Mandyhub finds them where their installers put them, and **Install missing tools for me** installs what is missing with winget (Windows asks for permission).
 
 ## Build
 
