@@ -2,6 +2,12 @@
 
 A community launcher for VIctory-based projects.
 
+**Play** opens a save picker. Continue your current save, start fresh, or copy
+an earlier save, a save from another build, or a favorite checkpoint. Fresh and
+copied saves become the build's active save and earlier saves remain available.
+To create a checkpoint, close the game, select a save in the picker, enter a
+name, and click **Favorite save**. Loading a checkpoint starts from a copy.
+
 - **Projects from PortWatch:** the list of public projects, live, with their reported frame rate, the graphics cards they were made for, and whether PortWatch has verified them.
 - **Custom repo links:** add any GitHub repo by its link.
 - **Install once, play many times:** a project is downloaded and built on your PC once and stays installed.

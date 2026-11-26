@@ -15,6 +15,7 @@ mod slides;
 mod look;
 mod fullscreen;
 mod tools;
+mod saves;
 
 use eframe::egui::{self, Color32, RichText, Rounding, Stroke, Vec2};
 use serde::{Deserialize, Serialize};
@@ -114,6 +115,7 @@ struct App {
     confirm_custom: Option<String>,
     /// The project an uninstall is being confirmed for.
     confirm_uninstall: Option<String>,
+    launch: Option<LaunchDialog>,
     /// A new install folder waiting for "move the projects there?" (from, to).
     pending_move: Option<(PathBuf, PathBuf)>,
     /// The folder the files were checked in was empty.
@@ -148,11 +150,18 @@ struct RepoState {
 }
 
 /// What the background job does.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum Kind {
     Install,
-    Play,
+    Play(saves::LaunchSave),
     Uninstall,
+}
+
+struct LaunchDialog {
+    project: Project,
+    choice: saves::LaunchSave,
+    checkpoint_name: String,
+    error: Option<String>,
 }
 
 fn slug(repo: &str) -> String {
@@ -321,7 +330,7 @@ fn set_install_dir(dir: &str) {
 }
 
 /// The parts of an install folder that belong to projects.
-const PROJECT_PARTS: &[&str] = &["repos", "target", "cache", "data"];
+const PROJECT_PARTS: &[&str] = &["repos", "target", "cache", "data", "checkpoints"];
 
 /// Whether `dir` holds any installed project.
 fn has_projects(dir: &Path) -> bool {
@@ -481,6 +490,7 @@ impl App {
             tools: None,
             confirm_custom: None,
             confirm_uninstall: None,
+            launch: None,
             pending_move: None,
             empty: false,
             finding: Arc::new(Mutex::new(None)),
@@ -548,7 +558,7 @@ impl App {
     fn all_projects(&self) -> Vec<Project> {
         let mut v: Vec<Project> = self.saved.custom.clone();
         if let Some(Ok(list)) = &*self.projects.lock().unwrap() {
-            v.extend(list.iter().cloned());
+            v.extend(list.iter().filter(|p| !self.saved.custom.iter().any(|custom| custom.repo.eq_ignore_ascii_case(&p.repo))).cloned());
         }
         v
     }
@@ -556,6 +566,104 @@ impl App {
     fn selected_project(&self) -> Option<Project> {
         let sel = self.saved.selected.as_ref()?;
         self.all_projects().into_iter().find(|p| &p.repo == sel)
+    }
+
+    fn launch_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.launch.take() else { return };
+        let ws = workspace();
+        let data = ws.join("data");
+        let project_data = data.join(slug(&dialog.project.repo));
+        let checkpoints = ws.join("checkpoints");
+        let mut sources = Vec::new();
+        for entry in std::fs::read_dir(&data).into_iter().flatten().flatten() {
+            if entry.path() != project_data {
+                if let Some(path) = saves::save_folder(&entry.path()) {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    sources.push((name, saves::LaunchSave::Copy(path)));
+                }
+            }
+        }
+        sources.sort_by(|a, b| a.0.cmp(&b.0));
+        let previous = saves::previous_saves(&project_data);
+        let mut favorites = Vec::new();
+        for entry in std::fs::read_dir(&checkpoints).into_iter().flatten().flatten() {
+            let name = entry.file_name();
+            if let Some(name) = name.to_str().and_then(|name| name.strip_prefix("Checkpoint - ")) {
+                if entry.path().is_dir() {
+                    favorites.push((name.to_owned(), saves::LaunchSave::Copy(entry.path())));
+                }
+            }
+        }
+        favorites.sort_by(|a, b| a.0.cmp(&b.0));
+        let running = self.job.lock().unwrap().running;
+        let mut open = true;
+        let mut cancel = false;
+        let mut play = false;
+        egui::Window::new(format!("Launch {}", dialog.project.name))
+            .id(egui::Id::new("launch-saves"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.radio_value(&mut dialog.choice, saves::LaunchSave::Continue, "Continue this build");
+                ui.radio_value(&mut dialog.choice, saves::LaunchSave::Fresh, "Start a fresh save");
+                egui::ScrollArea::vertical().max_height(225.0).show(ui, |ui| {
+                    if !previous.is_empty() {
+                        ui.separator();
+                        ui.label("Earlier saves from this build");
+                        for (name, path) in previous {
+                            ui.radio_value(&mut dialog.choice, saves::LaunchSave::Copy(path), name);
+                        }
+                    }
+                    if !sources.is_empty() {
+                        ui.separator();
+                        ui.label("Copy a save from another build");
+                        for (name, choice) in sources {
+                            ui.radio_value(&mut dialog.choice, choice, name);
+                        }
+                    }
+                    if !favorites.is_empty() {
+                        ui.separator();
+                        ui.label("Favorite checkpoints");
+                        for (name, choice) in favorites {
+                            ui.radio_value(&mut dialog.choice, choice, name);
+                        }
+                    }
+                });
+                let source = match &dialog.choice {
+                    saves::LaunchSave::Continue => saves::save_folder(&project_data),
+                    saves::LaunchSave::Copy(path) => Some(path.clone()),
+                    saves::LaunchSave::Fresh => None,
+                };
+                if let Some(source) = source {
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut dialog.checkpoint_name).hint_text("Checkpoint name"));
+                        if ui.add_enabled(!running && !dialog.checkpoint_name.trim().is_empty(), egui::Button::new("Favorite save")).clicked() {
+                            match saves::checkpoint(&checkpoints, &dialog.checkpoint_name, &source) {
+                                Ok(()) => {
+                                    dialog.checkpoint_name.clear();
+                                    dialog.error = None;
+                                }
+                                Err(e) => dialog.error = Some(format!("Could not save checkpoint: {e}")),
+                            }
+                        }
+                    });
+                }
+                if let Some(error) = &dialog.error {
+                    ui.colored_label(BAD, error);
+                }
+                ui.separator();
+                ui.horizontal(|ui| {
+                    play = ui.add_enabled(!running && self.files_ok(), egui::Button::new("Play")).clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if play {
+            self.start(ctx, dialog.project, Kind::Play(dialog.choice));
+        } else if open && !cancel {
+            self.launch = Some(dialog);
+        }
     }
 
     /// Looks again at `p`'s install and the newest version online.
@@ -628,9 +736,9 @@ impl App {
         }
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
-            let r = match kind {
+            let r = match &kind {
                 Kind::Install => install(&job, &ctx, &p),
-                Kind::Play => play(&job, &ctx, &p, &game_dir, series_s, scale, &extra, fullscreen),
+                Kind::Play(choice) => play(&job, &ctx, &p, &game_dir, series_s, scale, &extra, fullscreen, choice),
                 Kind::Uninstall => uninstall(&job, &ctx, &p),
             };
             {
@@ -641,7 +749,7 @@ impl App {
                         j.stage = match kind {
                             Kind::Install if updating => "Updated: ready to play".into(),
                             Kind::Install => "Installed: ready to play".into(),
-                            Kind::Play => "Game closed".into(),
+                            Kind::Play(_) => "Game closed".into(),
                             Kind::Uninstall => "Uninstalled".into(),
                         }
                     }
@@ -656,7 +764,7 @@ impl App {
                     }
                 }
             }
-            if kind != Kind::Play {
+            if !matches!(kind, Kind::Play(_)) {
                 let st = repo_state(&p);
                 repos.lock().unwrap().insert(p.repo.clone(), st);
             }
@@ -746,6 +854,7 @@ fn play(
     scale: f32,
     extra: &str,
     fullscreen: bool,
+    choice: &saves::LaunchSave,
 ) -> Result<(), String> {
     let exe = p.local_exe.as_ref().map(PathBuf::from).unwrap_or_else(|| built_exe(&p.repo));
     if !exe.is_file() {
@@ -766,9 +875,9 @@ fn play(
         c.env("VICTORY_OWN_UPSCALER", "1");
         c.env("VICTORY_RENDER_SCALE", format!("{scale:.2}"));
     }
-    let data = ws.join("data").join(slug(&p.repo));
-    let _ = std::fs::create_dir_all(&data);
-    c.env("VICTORY_DATA_DIR", &data);
+    let project_data = ws.join("data").join(slug(&p.repo));
+    let data = saves::prepare(&project_data, choice).map_err(|e| format!("Could not prepare saves: {e}"))?;
+    std::fs::create_dir_all(&data).map_err(|e| format!("Could not create the save folder: {e}"))?;
     c.env("VICTORY_CACHE_DIR", ws.join("cache").join(slug(&p.repo)));
     for line in extra.lines() {
         if let Some((k, v)) = line.split_once('=') {
@@ -777,6 +886,11 @@ fn play(
                 c.env(k, v.trim());
             }
         }
+    }
+    if data != project_data {
+        c.env("VICTORY_DATA_DIR", &data);
+    } else if !extra.lines().any(|line| line.split_once('=').is_some_and(|(key, _)| key.trim() == "VICTORY_DATA_DIR")) {
+        c.env("VICTORY_DATA_DIR", &data);
     }
     run_with(job, ctx, &mut c, |pid| {
         if fullscreen {
@@ -880,6 +994,7 @@ impl eframe::App for App {
         }
         let t = design::time(ctx);
 
+        let choosing_save = self.launch.is_some();
         // Header.
         let header = egui::TopBottomPanel::top("header").frame(look::glass().inner_margin(egui::Margin::symmetric(20.0, 12.0))).show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -893,7 +1008,7 @@ impl eframe::App for App {
                 });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let b = egui::Button::new(RichText::new("⚙  SETTINGS").strong().size(15.0)).min_size(Vec2::new(130.0, 36.0));
-                    if ui.add(b).clicked() {
+                    if ui.add_enabled(!choosing_save, b).clicked() {
                         self.show_settings = !self.show_settings;
                     }
                 });
@@ -903,21 +1018,26 @@ impl eframe::App for App {
 
         // Bottom: game folder, settings, play.
         egui::TopBottomPanel::bottom("play").frame(look::glass().inner_margin(16.0)).show(ctx, |ui| {
+            if choosing_save { ui.disable(); }
             self.bottom(ui, ctx);
         });
 
         // Left: the list.
         egui::SidePanel::left("list").exact_width((ctx.screen_rect().width() * 0.5).clamp(420.0, 700.0)).frame(look::glass().inner_margin(12.0)).show(ctx, |ui| {
+            if choosing_save { ui.disable(); }
             self.list(ui, ctx);
         });
 
         // Right: details and log.
         egui::CentralPanel::default().frame(look::glass().inner_margin(egui::Margin { left: 18.0, right: 18.0, top: 14.0, bottom: 8.0 })).show(ctx, |ui| {
+            if choosing_save { ui.disable(); }
             self.details(ui);
         });
 
         self.auto_check(ctx);
-        self.update_notice(ctx);
+        if !choosing_save {
+            self.update_notice(ctx);
+        }
 
         // Settings: a page of its own that slides in from the right over the
         // main page, and out again with Back.
@@ -1024,6 +1144,8 @@ impl eframe::App for App {
             }
         }
 
+        self.launch_dialog(ctx);
+
         if let Some(repo) = self.confirm_custom.clone() {
             let mut open = true;
             egui::Window::new("Add a custom repo?")
@@ -1039,7 +1161,7 @@ impl eframe::App for App {
                     ui.horizontal(|ui| {
                         if ui.button(RichText::new("Add it").color(TEXT)).clicked() {
                             let name = repo.split('/').next_back().unwrap_or(&repo).to_string();
-                            self.saved.custom.retain(|p| p.repo != repo);
+                            self.saved.custom.retain(|p| !p.repo.eq_ignore_ascii_case(&repo));
                             self.saved.custom.insert(0, Project {
                                 name,
                                 repo: repo.clone(),
@@ -1148,14 +1270,14 @@ impl App {
                                 }
                                 if p.custom {
                                     chip(ui, "custom", ORANGE);
-                                    if ui.small_button("remove").clicked() {
-                                        remove = Some(p.repo.clone());
-                                    }
                                 }
                             });
                         });
                         if resp.clicked() {
                             self.saved.selected = Some(p.repo.clone());
+                        }
+                        if p.custom && col.small_button("Remove").on_hover_text("Remove this custom entry from the list").clicked() {
+                            remove = Some(p.repo.clone());
                         }
                     }
                 });
@@ -1163,6 +1285,9 @@ impl App {
             }
             if let Some(r) = remove {
                 self.saved.custom.retain(|p| p.repo != r);
+                if self.saved.selected.as_deref() == Some(r.as_str()) {
+                    self.saved.selected = None;
+                }
             }
         });
     }
@@ -1679,7 +1804,7 @@ impl App {
         let selected = self.selected_project();
         let installed = selected.as_ref().and_then(|p| self.state_of(&p.repo)).is_some_and(|st| st.installed);
         // Playing needs the game files; installing needs Git and Rust.
-        let can = selected.is_some() && !running && if installed { self.files_ok() } else { tools_ok };
+        let can = selected.is_some() && !running && self.launch.is_none() && if installed { self.files_ok() } else { tools_ok };
         ui.horizontal(|ui| {
             let (icon, label) = if running {
                 ("⏳", "RUNNING")
@@ -1690,7 +1815,16 @@ impl App {
             };
             if look::big_pill(ui, icon, label, can, running, design::time(ctx)).clicked() {
                 if let Some(p) = selected.clone() {
-                    self.start(ctx, p, if installed { Kind::Play } else { Kind::Install });
+                    if installed {
+                        self.launch = Some(LaunchDialog {
+                            project: p,
+                            choice: saves::LaunchSave::Continue,
+                            checkpoint_name: String::new(),
+                            error: None,
+                        });
+                    } else {
+                        self.start(ctx, p, Kind::Install);
+                    }
                 }
             }
             ui.add_space(10.0);
