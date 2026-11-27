@@ -154,6 +154,36 @@ pub(crate) fn click_library_build(project: &Project, action: &str) {
 }
 
 #[test]
+fn queued_setup_keeps_choices_separate_and_cancel_preserves_profile() {
+    let mut h = Harness::new();
+    let root = std::env::temp_dir().join(format!("palmvi-setup-ui-{}",std::process::id()));
+    std::fs::create_dir_all(root.join("apps/victory/src")).unwrap();
+    for f in ["Get-NVIDIA-DLSS.cmd","PLAY.cmd","apps/victory/src/play.rs"] {
+        std::fs::write(root.join(f), []).unwrap();
+    }
+    let mut p=h.app.saved.custom[0].clone();
+    p.local_exe=Some(root.join("victory.exe").display().to_string());
+    let second=Project {repo:"example/second".into(),name:"Second fixture".into(),..p.clone()};
+    h.app.saved.custom=vec![p.clone(),second.clone()];
+    for project in [&p,&second] {h.app.saved.queue_project_setup(project);}
+    h.settle();
+    let first=h.app.native_setup.as_ref().unwrap().project.repo.clone();
+    h.click("Recommended optimizations");
+    h.click("Baseline");
+    assert!(h.app.native_setup.as_ref().unwrap().draft.nvidia_plain);
+    h.click("Save choices");
+    assert!(h.app.saved.project_launch[&first].nvidia_plain);
+    let next=h.app.native_setup.as_ref().unwrap().project.repo.clone();
+    assert_ne!(first,next);
+    h.app.native_setup.as_mut().unwrap().draft.nvidia_plain=true;
+    h.click("Decide later");
+    assert!(!h.app.saved.project_launch[&next].nvidia_plain);
+    assert!(h.app.native_setup.is_none());
+    assert!(h.app.saved.project_launch.values().all(|l|!l.pending_setup));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn library_profile_quick_choices_and_legacy_settings_round_trip() {
     let mut h = Harness::new();
     h.settle();
@@ -186,7 +216,7 @@ fn library_profile_quick_choices_and_legacy_settings_round_trip() {
     assert!(!h.labels.contains_key(&url));
     // The arrow edits in place. The body goes to the dedicated pane.
     let graphics = h.at("Graphics  ›");
-    let preset = h.at("Launch preset  ›");
+    let preset = h.at("Next launch  ›");
     let arrow = pos2(preset.x - 89.0, graphics.y);
     h.click_at(arrow);
     h.click("Fast");
@@ -211,6 +241,111 @@ fn library_profile_quick_choices_and_legacy_settings_round_trip() {
     assert_eq!(saved.launch_args, "--old");
     assert!(saved.warm_before_play && saved.save_choices.contains_key(repo));
     assert_eq!(saved.pinned, ["example/ocean"]);
+}
+
+#[test]
+fn save_edit_and_restore_a_named_setup_from_the_launch_page() {
+    let mut h = Harness::new();
+    let key = "example/ocean";
+    h.settle();
+    h.click("Ocean Drive");
+    h.click("Launch settings");
+    h.click("Name your preset");
+    h.frame(vec![Event::Text("Weekend setup".into())]);
+    h.settle();
+    h.click("Save profile as preset");
+    assert_eq!(h.app.saved.project_launch[key].selected_preset, None);
+    h.click("Weekend setup");
+    assert!(h.labels.contains_key("--old"));
+    assert_eq!(h.app.saved.project_launch[key].selected_preset, None);
+    h.click("Use for this project");
+    assert_eq!(h.app.saved.project_launch[key].selected_preset.as_deref(), Some("Weekend setup"));
+    h.app.saved.project_launch.get_mut(key).unwrap().args = Some("--edited".into());
+    h.settle();
+    assert!(h.labels.contains_key("Weekend setup · edited"));
+    h.click("Use for this project");
+    assert_eq!(h.app.saved.project_launch[key].args.as_deref(), Some("--old"));
+    assert_eq!(h.app.saved.launch_presets.len(), 1);
+    assert!(!h.labels.contains_key("Weekend setup · edited"));
+}
+
+#[test]
+fn profile_launch_cards_stack_when_narrow_and_manage_opens_the_presets_tab() {
+    let mut h = Harness::new();
+    h.settle();
+    h.click("Ocean Drive");
+    h.click("Launch settings");
+    assert!((h.at("Project sources").y - h.at("My presets").y).abs() < 5.0);
+    h.size = vec2(960.0, 820.0);
+    h.settle();
+    assert!(h.at("My presets").y > h.at("Project sources").y + 35.0);
+    h.click("Manage");
+    assert!(h.app.view == View::Presets);
+    h.click("ACTIVITY");
+    assert!(h.app.view == View::Activity);
+    h.click("PRESETS");
+    assert!(h.labels.contains_key("New preset"));
+}
+
+#[test]
+fn detected_script_can_be_copied_without_applying_or_losing_its_project_link() {
+    let mut h = Harness::new();
+    let dir = std::env::temp_dir().join(format!("palmvi-profile-scripts-{}",std::process::id()));
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    std::fs::write(dir.join("scripts/play-ocean.ps1"), "$set = @{\nVICTORY_LOG = 'trace'\n}").unwrap();
+    h.app.saved.custom[0].local_exe = Some(dir.join("victory.exe").display().to_string());
+    h.settle();
+    h.click("Ocean Drive");
+    h.click("Launch settings");
+    h.click("Save a copy");
+    let key = "example/ocean";
+    assert!(h.app.saved.project_launch[key].switches.is_none());
+    assert!(h.app.saved.launch_presets[0].repo_script.is_none());
+    h.click("Use script settings");
+    assert_eq!(h.app.saved.project_launch[key].switches.as_deref(), Some("VICTORY_LOG=trace"));
+    let active = h.app.saved.project_launch[key].selected_preset.clone();
+    h.click("Name your preset");
+    h.frame(vec![Event::Text("My script setup".into())]);
+    h.settle();
+    h.click("Save profile as preset");
+    assert_eq!(active, h.app.saved.project_launch[key].selected_preset);
+    assert_eq!(h.app.saved.launch_presets.iter().filter(|p|p.repo_script.is_none()).count(),2);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn manager_creates_multiple_presets_without_a_project_and_edits_independently() {
+    let mut h = Harness::new();
+    h.settle();
+    h.click("Activity / Presets");
+    h.click("PRESETS");
+    for name in ["Morning", "Evening"] {
+        h.click("New preset");
+        h.click("Name your preset");
+        h.frame(vec![Event::Text(name.into())]);
+        h.settle();
+        h.click("Save preset");
+    }
+    assert_eq!(h.app.saved.launch_presets.len(), 2);
+    assert!(h.app.saved.project_launch.values().all(|p|p.selected_preset.is_none()));
+    h.click("Evening");
+    assert!(h.labels.contains_key("Edit"));
+    h.click("Evening");
+    assert!(!h.labels.contains_key("Edit"));
+    h.click("Evening");
+    h.click("Edit");
+    h.click("Enter launch arguments");
+    h.frame(vec![Event::Text("--example".into())]);
+    h.settle();
+    h.click("Save preset");
+    assert_eq!(h.app.saved.launch_presets[1].args, "--example");
+    assert_eq!(h.app.saved.launch_presets[0].args, "");
+    h.click("Library");
+    h.click("Ocean Drive");
+    h.click("Launch settings");
+    h.click("Evening");
+    h.click("Use for this project");
+    assert_eq!(h.app.saved.project_launch["example/ocean"].args.as_deref(), Some("--example"));
 }
 
 #[test]
@@ -299,7 +434,7 @@ fn navigation_sharing_and_import_fit_the_minimum_window() {
     h.click("Discover");
     assert!(h.app.view == View::Discover);
     assert!(h.labels.contains_key("AMD") && h.labels.contains_key("vs PS5"));
-    h.click("Activity");
+    h.click("Activity / Presets");
     assert!(h.app.view == View::Activity);
     h.click("Library");
     h.click("Ocean Drive");

@@ -17,9 +17,10 @@ impl App {
         let graphics = self.saved.graphics_for(&p.repo);
         let launch = self.saved.project_launch.get(&key);
         let inherited = launch.is_none_or(|s| s.graphics.is_none());
-        let preset = launch
-            .and_then(|s| s.selected_preset.clone())
-            .unwrap_or_else(|| "Profile settings".into());
+        let method = crate::LaunchMethod::for_project(p, crate::nvidia_rt::supported(&crate::project_script_root(p)));
+        let active = launch.and_then(|profile| self.saved.launch_presets.iter().find(|s| Some(&s.name) == profile.selected_preset.as_ref()));
+        let preset = launch.map_or_else(|| "Project settings".into(), |profile| launch_presets::setup_name(
+            active, profile, if standalone { "" } else { &self.saved.launch_args }, &self.saved.extra_env, self.saved.default_graphics()));
         let save = self
             .saved
             .save_choices
@@ -43,7 +44,7 @@ impl App {
                 1,
             ));
         }
-        cards.push(("Launch preset", preset, "Open launch settings", 2));
+        cards.push(("Next launch", preset, "Open launch settings", 2));
         ui.columns(cards.len(),|cols|{
             for (ui,(label,value,hint,tab)) in cols.iter_mut().zip(cards){
                 let (r,_)=ui.allocate_exact_size(vec2(ui.available_width(),105.0),Sense::hover());
@@ -87,7 +88,7 @@ impl App {
                         }
                         _=>{
                             let mut chosen=None;
-                            for preset in self.saved.launch_presets.iter().filter(|s|!standalone||s.switches.is_none()){
+                            for preset in self.saved.launch_presets.iter().filter(|s|s.repo_script.is_none() && method.accepts(s)){
                                 if ui.selectable_label(value==preset.name,&preset.name).clicked(){chosen=Some(preset.clone());}
                             }
                             if let Some(preset)=chosen{
@@ -95,7 +96,7 @@ impl App {
                                 if let Err(e)=launch_presets::apply_to_profile(&mut self.saved.launch_presets,profile,&key,preset){self.log_export_status=Some((e,true));}
                                 ui.memory_mut(|m|m.close_popup());
                             }
-                            if ui.button("Manage presets…").clicked(){self.switch_tab(ui.ctx(),&p.repo,2);ui.memory_mut(|m|m.close_popup());}
+                            if ui.button("Open launch settings…").clicked(){self.switch_tab(ui.ctx(),&p.repo,2);ui.memory_mut(|m|m.close_popup());}
                         }
                     }
                 });

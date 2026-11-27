@@ -40,6 +40,8 @@ mod launch_presets;
 
 pub(crate) use save_picker::SavePicker;
 mod play_preset_picker;
+mod native_settings;
+pub(crate) use native_settings::NativeSetup;
 pub(crate) use play_preset_picker::PlayPresetPicker;
 
 /// The graphics modes: name, Series S profile, render scale, what it does.
@@ -109,8 +111,8 @@ fn graphics_mode(graphics: GraphicsSettings) -> Option<usize> {
     })
 }
 
-fn graphics_controls(ui: &mut Ui, graphics: &mut GraphicsSettings) {
-    ui.horizontal_wrapped(|ui| {
+fn graphics_controls(ui: &mut Ui, graphics: &mut GraphicsSettings, native_nvidia: bool) {
+    if !native_nvidia { ui.horizontal_wrapped(|ui| {
         let names = MODES.map(|mode| mode.0);
         if let Some(i) = theme::segmented(ui, "graphics-mode", &names, graphics_mode(*graphics), None) {
             graphics.series_s = MODES[i].1;
@@ -121,15 +123,20 @@ fn graphics_controls(ui: &mut Ui, graphics: &mut GraphicsSettings) {
             |i| MODES[i].3.to_owned(),
         );
         note(ui, &description);
-    });
+    }); }
     ui.horizontal_wrapped(|ui|{
         ui.label("Console profile");ui.selectable_value(&mut graphics.series_s,true,"Series S");ui.selectable_value(&mut graphics.series_s,false,"Series X");
     });
     ui.horizontal_wrapped(|ui|{
         ui.label("Output resolution");
-        for resolution in OutputResolution::OPTIONS{ui.selectable_value(&mut graphics.output,resolution,resolution.label());}
+        for resolution in OutputResolution::OPTIONS {
+            if native_nvidia && (resolution == OutputResolution::P936 || resolution == OutputResolution::P720 && !graphics.series_s) { continue; }
+            let label = if native_nvidia && resolution == OutputResolution::P1080 { "1080p → 1440p" } else { resolution.label() };
+            ui.selectable_value(&mut graphics.output,resolution,label);
+        }
     });
-    note(ui,"Output resolution requires support in the selected build.");
+    note(ui, if native_nvidia { "Series X defaults to 1440p. Series S renders at 720p. Saved F1 settings can override the native launcher." }
+        else { "Output resolution requires support in the selected build." });
     ui.add_space(12.0);
     graphics_options(ui, graphics);
 }
@@ -270,6 +277,14 @@ impl App {
             ctx.data_mut(|data| data.insert_temp(egui::Id::new(profile_tab_key(&p.repo)), 0_usize));
         }
         if just_selected {
+            self.saved.initialize_nvidia_profile(&p);
+            if let Some(profile) = self.saved.project_launch.get_mut(&project_key(&p.repo)) {
+                if profile.nvidia_defaults_initialized && crate::nvidia_rt::supported(&crate::project_script_root(&p)) {
+                    if let Some(rev) = crate::installed_revision(&p.repo) {
+                        if profile.nvidia_reviewed_revision.as_ref() != Some(&rev) { profile.pending_setup = true; }
+                    }
+                }
+            }
             self.log_export_status = None;
             self.shown = Some(p.repo.clone());
             self.shown_at = now;
@@ -474,6 +489,10 @@ impl App {
         let running=self.blocking_job(&p.repo,false).is_some();
         let install_blocked=self.blocking_job(&p.repo,true).is_some();
         if installed && p.local_exe.is_none(){ui.horizontal_wrapped(|ui|{
+            if crate::nvidia_rt::supported(&crate::project_script_root(p))
+                && theme::small(ui,Look::Secondary,Some(glyph::DOWNLOAD),"Install NVIDIA DLSS files",!running).on_hover_text("Download optional Streamline files from NVIDIA for DLSS and frame generation. Shared by this fork’s native launcher.").clicked(){
+                self.start(ctx,p.clone(),Kind::InstallDlss);
+            }
             if !p.runs_standalone() && theme::small(ui,Look::Ghost,Some(glyph::WARM),"Warm up shaders",!running&&self.files_ok()).clicked(){self.start(ctx,p.clone(),Kind::Warm);}
             if p.is_git() && theme::small(ui,Look::Secondary,Some(glyph::REPAIR),"Reinstall",!install_blocked).clicked(){self.start(ctx,p.clone(),Kind::Install);}
             if theme::small(ui,Look::Danger,Some(glyph::DELETE),"Uninstall",!running).clicked(){self.confirm_uninstall=Some(p.repo.clone());}
@@ -572,7 +591,7 @@ impl App {
     fn profile_tab_content(&mut self, ui: &mut Ui, ctx: &egui::Context, project: &Project, tab: usize) {
         match tab {
             1|2|3|4 if self.screenshot_projects.is_some()=>note(ui,"Hidden in sharing mode."),
-            1=>theme::card(ui,18.0,|ui|self.project_graphics_menu(ui,&project.repo)),
+            1=>theme::card(ui,18.0,|ui|self.project_graphics_menu(ui,project)),
             2=>self.project_launch_card(ui,project),
             3=>theme::card(ui,18.0,|ui|self.activity(ui,&project.repo)),
             4=>self.project_notes(ui,project),
@@ -585,37 +604,39 @@ impl App {
         let key = project_key(&project.repo);
         if self.saved.project_launch.get(&key).is_some_and(|launch| {
             launch.args.is_none() && launch.switches.is_none() && launch.graphics.is_none()
-                && launch.notes.is_empty() && !launch.has_confirmed_preset() && launch.reviewed_script_revision.is_none()
+                && !launch.pending_setup && !launch.nvidia_defaults_initialized && launch.notes.is_empty() && !launch.has_confirmed_preset() && launch.reviewed_script_revision.is_none()
         }) {
             self.saved.project_launch.remove(&key);
         }
     }
 
-    fn project_graphics_menu(&mut self, ui: &mut Ui, repo: &str) {
+    fn project_graphics_menu(&mut self, ui: &mut Ui, project: &Project) {
         let default_graphics = self.saved.default_graphics();
-        let key = project_key(repo);
+        let key = project_key(&project.repo);
         let launch = self.saved.project_launch.entry(key).or_default();
         ui.heading("Graphics preset");
         note(ui,if launch.graphics.is_some(){"Overrides global settings"}else{"Using global settings"});
         let mut graphics=launch.graphics.unwrap_or(default_graphics);
         let before=graphics;
-        graphics_controls(ui,&mut graphics);
+        graphics_controls(ui,&mut graphics,crate::nvidia_rt::supported(&crate::project_script_root(project)));
         if before!=graphics{launch.graphics=Some(graphics);}
         if launch.graphics.is_some() && ui.button("Use global settings").clicked(){launch.graphics=None;}
     }
 
     fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {
+        let native_nvidia = crate::nvidia_rt::supported(&crate::project_script_root(project));
+        let inherited_graphics = self.saved.default_graphics();
         let revision = self.state_of(&project.repo).and_then(|s| s.built);
-        let can_rescan = self.blocking_job(&project.repo, true).is_none() && crate::project_script_root(project).is_dir();
+        let can_rescan = !native_nvidia && self.blocking_job(&project.repo, true).is_none() && crate::project_script_root(project).is_dir();
         let global_args = &self.saved.launch_args;
         let global_switches = &self.saved.extra_env;
         let key = project_key(&project.repo);
         let launch = self.saved.project_launch.entry(key.clone()).or_default();
-        let review = ui.push_id(key, |ui| {
+        let open_manager = ui.push_id(key, |ui| {
             launch_presets::show(ui, &mut self.saved.launch_presets, launch, global_args, global_switches, project,
-                revision.as_deref(), can_rescan)
+                revision.as_deref(), can_rescan, native_nvidia.then_some(inherited_graphics), inherited_graphics)
         }).inner;
-        if review.is_some() { self.play_preset_picker = review; }
+        if open_manager { self.view = View::Presets; }
     }
 
     fn project_notes(&mut self, ui: &mut Ui, project: &Project) {
@@ -797,7 +818,7 @@ impl App {
             "These options may not work with every project or on older PCs. If a game will not start or looks wrong, choose Best quality and turn the fixes off.",
             |ui| {
                 let mut graphics = self.saved.default_graphics();
-                graphics_controls(ui, &mut graphics);
+                graphics_controls(ui, &mut graphics, false);
                 self.saved.series_s = graphics.series_s;
                 self.saved.render_scale = graphics.render_scale;
                 self.saved.fix_8gb = graphics.fix_8gb;
@@ -1006,13 +1027,55 @@ impl App {
             let job = self.job.lock().unwrap();
             (job.running, job.import_error.clone())
         };
-        let open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some()
+        let other_open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some()
             || self.save_picker.is_some() || self.play_preset_picker.is_some() || import_error.is_some();
+        if !other_open && self.native_setup.is_none() && self.screenshot_projects.is_none()
+            && self.saved.project_launch.values().any(|p| p.pending_setup) {
+            let projects = self.all_projects();
+            if let Some(key) = self.saved.project_launch.iter().find(|(_,p)| p.pending_setup).map(|(k,_)|k.clone()) {
+                let profile = self.saved.project_launch.get_mut(&key).unwrap();
+                profile.pending_setup = false;
+                if let Some(project) = projects.into_iter().find(|p| project_key(&p.repo)==key) {
+                    if crate::nvidia_rt::supported(&crate::project_script_root(&project)) {
+                        let revision = crate::installed_revision(&project.repo);
+                        self.native_setup = Some(NativeSetup {project, revision, draft: profile.clone()});
+                        profile.pending_setup = true;
+                    } else if !project.runs_standalone() {
+                        let review = PlayPresetPicker::after_project_update(&project,&self.saved.launch_presets,Some(profile));
+                        self.play_preset_picker = review.or_else(|| {
+                            let picker=PlayPresetPicker::rescan(&project,&self.saved.launch_presets,profile);
+                            picker.has_scripts().then_some(picker)
+                        });
+                    }
+                }
+                ctx.request_repaint();
+            }
+        }
+        let open = other_open || self.native_setup.is_some() || self.play_preset_picker.is_some();
         if open && !self.modal_was_open {
             self.modal_at = now;
         }
         self.modal_was_open = open;
         let t0 = self.modal_at;
+        if !other_open && self.screenshot_projects.is_none() {
+            if let Some(mut setup)=self.native_setup.take() {
+                match setup.show(ctx,t0,self.saved.default_graphics(),&self.saved.launch_args,&self.saved.extra_env) {
+                    Some(save)=>{
+                        let profile=self.saved.project_launch.entry(project_key(&setup.project.repo)).or_default();
+                        if save {
+                            profile.graphics=setup.draft.graphics;
+                            profile.args=setup.draft.args;
+                            profile.switches=setup.draft.switches;
+                            profile.nvidia_plain=setup.draft.nvidia_plain;
+                            profile.selected_preset=setup.draft.selected_preset;
+                        }
+                        profile.pending_setup=crate::installed_revision(&setup.project.repo)!=setup.revision;
+                        profile.nvidia_reviewed_revision=setup.revision;
+                    }
+                    None=>self.native_setup=Some(setup),
+                }
+            }
+        }
 
         if let Some(mut picker) = self.save_picker.take() {
             let alias = self.screenshot_alias(&picker.project.repo).map(|(name, _)| name);

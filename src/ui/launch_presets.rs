@@ -1,26 +1,20 @@
 use super::{note, section, wrapped};
 use crate::script_preset;
 use crate::theme::{self, Look};
-use crate::{LaunchPreset, Project, ProjectLaunch};
+use crate::{LaunchMethod, LaunchPreset, Project, ProjectLaunch};
 use eframe::egui::{self, Ui};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
 
+pub(super) mod manager;
+
 const MAX_PRESET_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Default)]
 struct Picker {
-    selected: Option<String>,
-    detected: Option<LaunchPreset>,
-    last_applied: Option<String>,
-    confirm_delete: bool,
-    show_save: bool,
-    show_paste: bool,
+    detected: Vec<LaunchPreset>,
     name: String,
-    pasted: String,
-    args_only: bool,
-    save_status: Option<Result<String, String>>,
     status: Option<Result<String, String>>,
 }
 
@@ -33,38 +27,27 @@ pub(super) fn show(
     project: &Project,
     revision: Option<&str>,
     can_rescan: bool,
-) -> Option<super::PlayPresetPicker> {
+    native_graphics: Option<crate::GraphicsSettings>,
+    global_graphics: crate::GraphicsSettings,
+) -> bool {
     let standalone = project.runs_standalone();
     let project_key = crate::project_key(&project.repo);
     let id = ui.make_persistent_id(("launch-preset-picker", revision));
-    let mut review = None;
+    let mut open_manager = false;
     let mut picker = ui
         .ctx()
         .data(|data| data.get_temp::<Picker>(id))
         .unwrap_or_else(|| Picker {
-            detected: (!standalone)
-                .then(|| super::play_preset_picker::detected_preset(project))
-                .flatten(),
+            detected: if standalone { vec![] } else { super::play_preset_picker::detected_scripts(project) },
             ..Picker::default()
         });
-    let compatible = |preset: &LaunchPreset| !standalone || preset.switches.is_none();
-    if let Some(detected) = &picker.detected {
+    let method = LaunchMethod::for_project(project, native_graphics.is_some());
+    let compatible = |preset: &LaunchPreset| method.accepts(preset) && preset.repo_script.is_none();
+    for detected in &picker.detected {
         restore_probe_control(presets, launch, &project_key, detected);
     }
-    if picker.last_applied != launch.selected_preset {
-        picker.last_applied = launch.selected_preset.clone();
-        picker.select(launch.selected_preset.clone());
-    }
-    if picker.selected.as_ref().is_some_and(|name| {
-        !presets
-            .iter()
-            .any(|preset| preset.name == *name && compatible(preset))
-    }) {
-        picker.select(None);
-    }
-
-    section(ui, "Project launch settings", None, "", |ui| {
-        let inherited_args = if standalone { "" } else { global_args };
+    let inherited_args = if standalone { "" } else { global_args };
+    let advanced = |ui: &mut Ui, launch: &mut ProjectLaunch| {
         ui.horizontal_wrapped(|ui| {
             ui.strong("Launch arguments");
             if !standalone {
@@ -74,6 +57,8 @@ pub(super) fn show(
         let mut args = launch.args.as_deref().unwrap_or(inherited_args).to_owned();
         let hint = if standalone {
             "Paste program arguments"
+        } else if native_graphics.is_some() {
+            "Additional native options"
         } else {
             "Paste launch arguments, e.g. --strict"
         };
@@ -81,7 +66,7 @@ pub(super) fn show(
             launch.args = Some(args);
         }
         if !standalone {
-            note(ui, "Put game arguments after --.");
+            if native_graphics.is_none() {note(ui, "Put game arguments after --.");}
             ui.add_space(10.0);
             ui.horizontal_wrapped(|ui| {
                 ui.strong("Launch switches");
@@ -94,9 +79,6 @@ pub(super) fn show(
                 .as_deref()
                 .unwrap_or(global_switches)
                 .to_owned();
-            if let Some(options) = launch.script_options {
-                show_script_options(ui, &mut switches, options);
-            }
             egui::ScrollArea::vertical()
                 .id_salt("switches")
                 .max_height(140.0)
@@ -116,258 +98,204 @@ pub(super) fn show(
             }
         }
 
-        ui.add_space(8.0);
-        if !picker.show_save
-            && theme::small(ui, Look::Primary, None, "Save as preset…", true).clicked()
-        {
-            picker.show_save = true;
-            picker.save_status = None;
-        }
-        if picker.show_save {
-            ui.horizontal_wrapped(|ui| {
-                theme::field(ui, &mut picker.name, "Preset name", 200.0, None);
-                if !standalone {
-                    ui.checkbox(&mut picker.args_only, "Arguments only")
-                        .on_hover_text("Presets include launch switches by default.");
+    };
+    let current = presets.iter().find(|p| launch.selected_preset.as_ref() == Some(&p.name));
+    let active_script = current.filter(|p| p.projects.contains(&project_key)).and_then(|p| p.repo_script.clone());
+    let title = setup_name(current, launch, inherited_args, global_switches, global_graphics);
+    theme::card(ui, 16.0, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            theme::icon(ui, theme::glyph::PLAY, 19.0, theme::pink());
+            theme::caps(ui, "Next launch", 11.0, theme::pink());
+            theme::badge(ui, manager::method_label(Some(method)), theme::lilac());
+        });
+        ui.label(egui::RichText::new(&title).font(theme::strong(23.0)).color(theme::white()));
+        ui.horizontal_wrapped(|ui| {
+            let field = theme::field(ui, &mut picker.name, "Name your preset", 195.0, None);
+            let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+            let named = !picker.name.trim().is_empty();
+            if theme::small(ui, Look::Primary, None, "Save profile as preset", named).clicked() || (enter && named) {
+                let mut preset = snapshot(method, picker.name.trim(), launch, inherited_args, global_switches, global_graphics);
+                if let Some(source) = presets.iter().find(|p| Some(&p.name) == launch.selected_preset.as_ref() && p.projects.contains(&project_key))
+                    .and_then(|p| p.repo_script.as_ref()).and_then(|source| picker.detected.iter().find(|p| p.repo_script.as_ref()==Some(source))) {
+                    if let (Some(old), Some(new)) = (preset.script_options.as_mut(), source.script_options) { old.shader_pass = new.shader_pass; }
                 }
-                let include_switches = !standalone && !picker.args_only;
-                let save_label = if include_switches {
-                    "Save arguments and switches"
-                } else {
-                    "Save arguments"
-                };
-                if theme::small(
-                    ui,
-                    Look::Primary,
-                    None,
-                    save_label,
-                    !picker.name.trim().is_empty(),
-                )
-                .clicked()
-                {
-                    let preset = LaunchPreset {
-                        name: picker.name.trim().to_owned(),
-                        args: launch.args.as_deref().unwrap_or(inherited_args).to_owned(),
-                        switches: include_switches.then(|| {
-                            launch
-                                .switches
-                                .as_deref()
-                                .unwrap_or(global_switches)
-                                .to_owned()
-                        }),
-                        script_options: if include_switches {
-                            launch.script_options
-                        } else {
-                            None
-                        },
-                        projects: vec![project_key.clone()],
-                        repo_script: None,
-                    };
-                    picker.save_status = Some(store(presets, preset).map(|index| {
-                        let name = presets[index].name.clone();
-                        picker.select(Some(name.clone()));
-                        picker.name.clear();
-                        picker.show_save = false;
-                        format!("Saved “{name}” to your presets.")
-                    }));
-                }
-                if theme::small(ui, Look::Ghost, None, "Cancel", true).clicked() {
-                    picker.show_save = false;
-                    picker.save_status = None;
-                }
-            });
-        }
-        show_status(ui, &picker.save_status);
+                picker.status = Some(store(presets, preset).map(|i| {
+                    picker.name.clear();
+                    format!("Saved “{}” to My presets.", presets[i].name)
+                }));
+            }
+        });
     });
-
-    ui.add_space(12.0);
-    section(ui, "Saved presets", None, "", |ui| {
-        ui.horizontal_wrapped(|ui| {
-            let detected = picker
-                .detected
-                .as_ref()
-                .filter(|candidate| {
-                    !presets.iter().any(|saved| {
-                        saved.repo_script == candidate.repo_script
-                            && saved.projects.contains(&project_key)
-                    })
-                })
-                .cloned();
-            let label = picker
-                .selected
-                .clone()
-                .or_else(|| {
-                    detected
-                        .as_ref()
-                        .map(|preset| format!("{} · Detected script", preset.name))
-                })
-                .unwrap_or_else(|| "Choose a preset".into());
-            egui::ComboBox::from_id_salt("preset")
-                .selected_text(label)
-                .width(185.0)
-                .show_ui(ui, |ui| {
-                    if let Some(detected) = &detected {
-                        if ui
-                            .selectable_label(
-                                picker.selected.is_none(),
-                                format!("{} · Detected script", detected.name),
-                            )
-                            .clicked()
-                        {
-                            picker.select(None);
-                        }
-                    } else if !presets.iter().any(compatible) {
-                        ui.label("No saved presets for this project type.");
-                    }
-                    for preset in presets.iter().filter(|preset| compatible(preset)) {
-                        if ui
-                            .selectable_label(
-                                picker.selected.as_deref() == Some(&preset.name),
-                                &preset.name,
-                            )
-                            .clicked()
-                        {
-                            picker.select(Some(preset.name.clone()));
-                        }
-                    }
-                });
-            let selected = picker.preset(presets).or(detected.as_ref());
-            let apply = theme::small(
-                ui,
-                Look::Primary,
-                None,
-                "Apply to project",
-                selected.is_some(),
-            )
-            .clicked();
-            if let Some(preset) = selected {
-                ui.menu_button("Share", |ui| {
-                    if ui.button("Export JSON file…").clicked() {
-                        ui.close_menu();
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("Launch preset", &["json"])
-                            .set_file_name("launch-preset.json")
-                            .save_file()
-                        {
-                            picker.status = Some(encode(preset).and_then(|json| {
-                                std::fs::write(path, json)
-                                    .map_err(|error| format!("Could not export preset: {error}"))?;
-                                Ok("Preset exported.".into())
-                            }));
-                        }
-                    }
-                    if ui.button("Copy preset text").clicked() {
-                        ui.close_menu();
-                        picker.status = Some(encode(preset).map(|json| {
-                            ui.ctx().copy_text(json);
-                            "Preset text copied.".into()
-                        }));
-                    }
-                });
-            }
-            if theme::small(ui, Look::Ghost, None, "Delete…", picker.selected.is_some()).clicked()
-            {
-                picker.confirm_delete = true;
-                picker.show_paste = false;
-            }
-            if apply {
-                if let Some(preset) = selected.cloned() {
-                    let result = apply_to_profile(presets, launch, &project_key, preset);
-                    if let Ok(name) = &result {
-                        launch.reviewed_script_revision = revision.map(str::to_owned);
-                        picker.select(Some(name.clone()));
-                        picker.last_applied = Some(name.clone());
-                        ui.ctx().request_repaint();
-                    }
-                    picker.status =
-                        Some(result.map(|name| format!("Applied “{name}” to this profile.")));
-                }
-            }
-        });
-
-        ui.horizontal_wrapped(|ui| {
-            if !standalone && theme::small(ui, Look::Secondary, Some(theme::glyph::SYNC), "Rescan scripts", can_rescan)
-                .on_hover_text("Read the installed launch scripts again and choose one for this profile.").clicked() {
-                let scan = super::PlayPresetPicker::rescan(project, presets, launch);
-                picker.detected = scan.recommended_script();
-                review = Some(scan);
-            }
-            if theme::small(ui, Look::Secondary, None, "Import file…", true)
-                .on_hover_text("Choose a preset JSON file or a PowerShell launch script.")
-                .clicked()
-            {
-                let mut dialog =
-                    rfd::FileDialog::new().add_filter("Preset or launch script", &["json", "ps1"]);
-                let scripts = crate::project_script_root(project).join("scripts");
-                if scripts.is_dir() {
-                    dialog = dialog.set_directory(scripts);
-                }
-                if let Some(path) = dialog.pick_file() {
-                    picker.accept_import(presets, import_file(&path), compatible, &project_key);
-                }
-            }
-            if !picker.show_paste
-                && theme::small(ui, Look::Secondary, None, "Paste preset text…", true).clicked()
-            {
-                picker.show_paste = true;
-                picker.confirm_delete = false;
-                picker.status = None;
-            }
-        });
-
-        if picker.show_paste {
-            ui.add(
-                egui::TextEdit::multiline(&mut picker.pasted)
-                    .hint_text("Paste the JSON from Copy preset text")
-                    .desired_rows(3)
-                    .desired_width(f32::INFINITY),
-            );
+    ui.add_space(8.0);
+    let mut chosen_script = None;
+    let mut copy_script = None;
+    let mut chosen_preset = None;
+    let mut sources = |ui: &mut Ui| {
+        theme::card(ui, 14.0, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if theme::small(
-                    ui,
-                    Look::Primary,
-                    None,
-                    "Import preset",
-                    !picker.pasted.trim().is_empty(),
-                )
-                .clicked()
-                {
-                    let imported = decode(&picker.pasted);
-                    if picker.accept_import(presets, imported, compatible, &project_key) {
-                        picker.pasted.clear();
-                        picker.show_paste = false;
-                    }
-                }
-                if theme::small(ui, Look::Ghost, None, "Cancel", true).clicked() {
-                    picker.show_paste = false;
-                    picker.status = None;
+                theme::icon(ui, theme::glyph::FOLDER, 16.0, theme::lilac());
+                ui.label(egui::RichText::new("Project sources").font(theme::strong(18.0)));
+                if method == LaunchMethod::Victory && theme::small(ui, Look::Ghost, Some(theme::glyph::SYNC), "Rescan", can_rescan).clicked() {
+                    picker.detected = super::play_preset_picker::detected_scripts(project);
+                    picker.status = Some(Ok(format!("Found {} supported launch scripts.", picker.detected.len())));
                 }
             });
-        }
-
-        if picker.confirm_delete {
-            if let Some(name) = picker.selected.clone() {
-                wrapped(ui, &format!("Delete “{name}” from your preset library? Projects keep the settings already applied."), theme::blush());
-                ui.horizontal_wrapped(|ui| {
-                    if theme::small(ui, Look::Danger, None, "Delete preset", true).clicked() {
-                        presets.retain(|preset| preset.name != name);
-                        if launch.selected_preset.as_deref() == Some(&name) {
-                            launch.selected_preset = None;
-                            picker.last_applied = None;
-                        }
-                        picker.select(None);
-                        picker.status = Some(Ok(format!("Deleted “{name}”.")));
-                    }
-                    if theme::small(ui, Look::Ghost, None, "Cancel", true).clicked() {
-                        picker.confirm_delete = false;
-                    }
+            match method {
+                LaunchMethod::Program => note(ui, "Play starts the project’s executable."),
+                LaunchMethod::Nvidia => { theme::badge(ui, "PLAY.cmd", theme::good()); note(ui, "Native launch options are available below."); }
+                LaunchMethod::Victory if picker.detected.is_empty() => note(ui, "No supported script found. Enter launch arguments below."),
+                LaunchMethod::Victory => for script in &picker.detected {
+                    let active = active_script == script.repo_script;
+                    ui.push_id(&script.name, |ui| {
+                        egui::Frame::none().fill(theme::deep()).rounding(8.0).inner_margin(10.0).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.horizontal_wrapped(|ui| {
+                                ui.label(egui::RichText::new(format!("{}.ps1",script.name)).font(theme::strong(14.0)));
+                                if active { theme::badge(ui,"In use",theme::good()); }
+                                note(ui, &format!("{} switches",script.switches.as_deref().unwrap_or("").lines().count()));
+                            });
+                            if !active {
+                                ui.horizontal_wrapped(|ui| {
+                                    if theme::small(ui, Look::Secondary, None, "Use script settings", true).clicked() { chosen_script = Some(script.clone()); }
+                                    if theme::small(ui, Look::Ghost, Some(theme::glyph::COPY), "Save a copy", true).clicked() { copy_script = Some(script.clone()); }
+                                });
+                            }
+                        });
+                    });
+                }
+            }
+        });
+    };
+    let mut shelf = |ui: &mut Ui| {
+        theme::card(ui, 14.0, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                theme::icon(ui, theme::glyph::SETTINGS, 16.0, theme::pink());
+                ui.label(egui::RichText::new("My presets").font(theme::strong(18.0)));
+                if theme::small(ui, Look::Ghost, Some(theme::glyph::OPEN), "Manage", true).clicked() { open_manager = true; }
+            });
+            if !presets.iter().any(compatible) { note(ui, "Save this profile to add your first compatible preset."); }
+            for p in presets.iter().filter(|p| compatible(p)) {
+                let using = launch.selected_preset.as_ref() == Some(&p.name) && p.matches_profile(launch, inherited_args, global_switches, global_graphics);
+                preset_card(ui, p, using, |ui| {
+                    if theme::small(ui, Look::Primary, None, "Use for this project", !using).clicked() { chosen_preset = Some(p.clone()); }
                 });
             }
+        });
+    };
+    if ui.available_width() >= 740.0 {
+        ui.columns(2, |columns| { sources(&mut columns[0]); shelf(&mut columns[1]); });
+    } else { sources(ui); ui.add_space(6.0); shelf(ui); }
+    if let Some(mut script) = copy_script {
+        script.repo_script = None;
+        script.projects.clear();
+        picker.status = Some(store(presets, script).map(|i|format!("Saved “{}” to My presets.",presets[i].name)));
+    }
+    if let Some(script) = chosen_script {
+        picker.status = Some(apply_to_profile(presets, launch, &project_key, script).map(|_| {
+            launch.reviewed_script_revision = revision.map(str::to_owned);
+            "Script settings applied to this project.".into()
+        }));
+    }
+    if let Some(preset) = chosen_preset {
+        picker.status = Some(apply_to_profile(presets, launch, &project_key, preset).map(|name| format!("Using “{name}”.")));
+    }
+    show_status(ui,&picker.status);
+    ui.add_space(8.0);
+    section(ui, "Launch options", None, "", |ui| {
+        if let Some(graphics) = native_graphics {
+            super::native_settings::controls(ui, launch, graphics, global_args, global_switches);
+        } else if let Some(options) = launch.script_options {
+            let mut switches = launch.switches.as_deref().unwrap_or(global_switches).to_owned();
+            show_script_options(ui, &mut switches, options);
+            if switches != launch.switches.as_deref().unwrap_or(global_switches) { launch.switches = Some(switches); }
         }
-        show_status(ui, &picker.status);
+        advanced(ui, launch);
     });
     ui.ctx().data_mut(|data| data.insert_temp(id, picker));
-    review
+    open_manager
+}
+
+/// Both the project and the workspace use the same read-only preview.
+fn preset_card<R>(ui: &mut Ui, preset: &LaunchPreset, active: bool, actions: impl FnOnce(&mut Ui) -> R) {
+    ui.push_id(("preset-card", &preset.name), |ui| {
+        theme::card(ui, 10.0, |ui| {
+            let mut state = egui::collapsing_header::CollapsingState::load_with_default_open(
+                ui.ctx(), ui.make_persistent_id("expanded"), false,
+            );
+            let (rect, hit) = ui.allocate_exact_size(egui::vec2(ui.available_width(), 48.0), egui::Sense::click());
+            let hit = hit.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if hit.clicked() { state.toggle(ui); }
+            let accent = if active { theme::good() } else { theme::lilac() };
+            let painter = ui.painter();
+            if hit.hovered() || hit.has_focus() { painter.rect_filled(rect, 7.0, theme::raised()); }
+            let tile = egui::Rect::from_center_size(egui::pos2(rect.left()+23.0, rect.center().y), egui::vec2(36.0,36.0));
+            painter.rect_filled(tile, 8.0, accent.gamma_multiply(0.18));
+            let center = tile.center();
+            for (y, x) in [(-5.0,-3.0),(0.0,4.0),(5.0,-1.0)] {
+                painter.hline(center.x-8.0..=center.x+8.0,center.y+y,egui::Stroke::new(1.4_f32,accent));
+                painter.circle_filled(center+egui::vec2(x,y),2.1,accent);
+            }
+            let left = rect.left()+52.0;
+            let width = rect.right()-left-32.0;
+            let title = theme::one_line(ui, &preset.name, theme::strong(16.0), theme::white(), width);
+            painter.galley(egui::pos2(left,rect.top()+4.0),title,theme::white());
+            let method = manager::method_label(preset.method.or(preset.nvidia.as_ref().map(|_| LaunchMethod::Nvidia)));
+            let caption = if active { format!("{method} · In use") } else { method.to_string() };
+            let subtitle = theme::one_line(ui,&caption,theme::regular(12.0),theme::muted(),width);
+            painter.galley(egui::pos2(left,rect.top()+27.0), subtitle, theme::muted());
+            let arrow = egui::pos2(rect.right()-14.0,rect.center().y);
+            let dy = if state.is_open() { -2.5 } else { 2.5 };
+            painter.add(egui::Shape::line(vec![arrow+egui::vec2(-5.0,-dy),arrow+egui::vec2(0.0,dy),arrow+egui::vec2(5.0,-dy)], egui::Stroke::new(1.7_f32,accent)));
+            hit.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button,true,format!("{} settings",preset.name)));
+            state.show_body_unindented(ui, |ui| {
+                ui.separator();
+                if let Some(native) = &preset.nvidia {
+                    let g = native.graphics;
+                    ui.horizontal_wrapped(|ui| {
+                        for value in [if g.series_s { "Series S" } else { "Series X" }, g.output.label(),
+                            if native.baseline { "Baseline" } else { "Recommended optimizations" }] {
+                            theme::badge(ui, value, accent);
+                        }
+                    });
+                    note(ui,&format!("Render scale {:.0}% · {} · 8 GB fix {} · Bright shadows {}",g.render_scale*100.0,
+                        if g.fullscreen {"Fullscreen"} else {"Windowed"}, if g.fix_8gb {"on"} else {"off"}, if g.bright_shadows {"on"} else {"off"}));
+                }
+                theme::caps(ui,"Arguments",10.0,theme::muted());
+                ui.add(egui::Label::new(egui::RichText::new(if preset.args.is_empty() { "None" } else { &preset.args }).font(theme::mono(12.5))).wrap());
+                if preset.method != Some(LaunchMethod::Program) {
+                    theme::caps(ui,"Switches",10.0,theme::muted());
+                    let switches = match preset.switches.as_deref() { None => "Keep project switches", Some("") => "None", Some(value) => value };
+                    egui::ScrollArea::vertical().id_salt("switch-preview").max_height(160.0).show(ui,|ui| {
+                        ui.add(egui::Label::new(egui::RichText::new(switches).font(theme::mono(12.5))).wrap());
+                    });
+                }
+                if preset.script_options.is_some_and(|opts| opts.shader_pass) { note(ui, "Script shader warm-up enabled"); }
+                ui.add_space(4.0);
+                actions(ui);
+            });
+        });
+    });
+}
+
+pub(super) fn setup_name(current: Option<&LaunchPreset>, profile: &ProjectLaunch, args: &str, switches: &str, graphics: crate::GraphicsSettings) -> String {
+    let Some(preset) = current else { return "Project settings".into(); };
+    let mut name = preset.repo_script.as_ref().map_or_else(|| preset.name.clone(), |script| format!("Settings from {script}.ps1"));
+    if !preset.matches_profile(profile, args, switches, graphics) { name.push_str(" · edited"); }
+    name
+}
+
+fn snapshot(method: LaunchMethod, name: &str, profile: &ProjectLaunch, args: &str, switches: &str, graphics: crate::GraphicsSettings) -> LaunchPreset {
+    LaunchPreset {
+        method: Some(method),
+        name: name.into(),
+        args: profile.args.as_deref().unwrap_or(args).into(),
+        switches: (method != LaunchMethod::Program).then(|| profile.switches.as_deref().unwrap_or(switches).into()),
+        script_options: if method == LaunchMethod::Program { None } else { profile.script_options },
+        nvidia: (method == LaunchMethod::Nvidia).then(|| crate::NvidiaPreset {
+            graphics: profile.graphics.unwrap_or(graphics), baseline: profile.nvidia_plain,
+        }),
+        projects: Vec::new(), repo_script: None,
+    }
 }
 
 fn reset_to_global(ui: &mut Ui, value: &mut Option<String>) -> bool {
@@ -390,48 +318,15 @@ fn show_status(ui: &mut Ui, status: &Option<Result<String, String>>) {
     }
 }
 
-impl Picker {
-    fn select(&mut self, name: Option<String>) {
-        self.selected = name;
-        self.confirm_delete = false;
-    }
-
-    fn preset<'a>(&self, presets: &'a [LaunchPreset]) -> Option<&'a LaunchPreset> {
-        let name = self.selected.as_deref()?;
-        presets.iter().find(|preset| preset.name == name)
-    }
-
-    fn accept_import(
-        &mut self,
-        presets: &mut Vec<LaunchPreset>,
-        imported: Result<LaunchPreset, String>,
-        compatible: impl FnOnce(&LaunchPreset) -> bool,
-        project_key: &str,
-    ) -> bool {
-        self.status = Some(
-            imported
-                .and_then(|mut preset| {
-                    preset.projects = vec![project_key.to_owned()];
-                    preset.repo_script = None;
-                    store(presets, preset)
-                })
-                .map(|index| {
-                    if compatible(&presets[index]) {
-                        self.select(Some(presets[index].name.clone()));
-                    }
-                    format!("Imported {} into your saved presets.", presets[index].name)
-                }),
-        );
-        self.status.as_ref().is_some_and(Result::is_ok)
-    }
-}
-
 pub(super) fn apply_to_profile(
     presets: &mut Vec<LaunchPreset>,
     launch: &mut ProjectLaunch,
     project_key: &str,
     mut preset: LaunchPreset,
 ) -> Result<String, String> {
+    if preset.nvidia.is_some() && !launch.nvidia_defaults_initialized {
+        return Err("This preset needs a project with the NVIDIA native launcher.".into());
+    }
     let existing = if preset.repo_script.is_some() {
         presets.iter().position(|saved| {
             saved.repo_script == preset.repo_script
@@ -520,6 +415,8 @@ pub(super) fn import_file(path: &Path) -> Result<LaunchPreset, String> {
     }
     let (switches, options) = script_preset::parse(&text)?;
     Ok(LaunchPreset {
+        method: Some(LaunchMethod::Victory),
+        nvidia: None,
         name: path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -635,8 +532,51 @@ fn encode(preset: &LaunchPreset) -> Result<String, String> {
 
 #[cfg(test)]
 #[test]
+fn native_preset_export_restores_graphics_tuning_and_native_arguments() {
+    let graphics = crate::Saved::default().default_graphics();
+    let preset = LaunchPreset {
+        method: None,
+        nvidia: Some(crate::NvidiaPreset{graphics,baseline:true}),
+        name:"Quiet evening".into(),args:"--dlss balanced --fps 60".into(),
+        switches:Some("VICTORY_REFLEX=boost".into()),projects:vec!["example/one".into()],
+        repo_script:None,script_options:None,
+    };
+    let json=encode(&preset).unwrap();
+    let mut saved=Vec::new();
+    let mut profile=ProjectLaunch::default();
+    assert!(apply_to_profile(&mut saved,&mut profile,"another/project",decode(&json).unwrap()).is_err());
+    profile.nvidia_defaults_initialized=true;
+    apply_to_profile(&mut saved,&mut profile,"another/project",decode(&json).unwrap()).unwrap();
+    assert!(profile.graphics==Some(graphics) && profile.nvidia_plain);
+    assert_eq!(profile.args.as_deref(),Some("--dlss balanced --fps 60"));
+    assert_eq!(profile.switches.as_deref(),Some("VICTORY_REFLEX=boost"));
+}
+
+#[cfg(test)]
+#[test]
+fn named_script_copy_keeps_warmup_and_only_appears_for_compatible_projects() {
+    let mut saved = crate::Saved::default();
+    let graphics = saved.default_graphics();
+    let (_, options) = script_preset::parse("$set = @{\nVICTORY_LOG = 'info'\n}\n& $Victory shaders $rpf").unwrap();
+    let profile = saved.project_launch.entry("example/test".into()).or_default();
+    profile.switches = Some("VICTORY_LOG=info".into());
+    profile.script_options = Some(options);
+    let copy = snapshot(LaunchMethod::Victory, "Warm setup", profile, "", "", graphics);
+    let portable = decode(&encode(&copy).unwrap()).unwrap();
+    assert!(LaunchMethod::Victory.accepts(&portable));
+    assert!(!LaunchMethod::Nvidia.accepts(&portable) && !LaunchMethod::Program.accepts(&portable));
+    apply_to_profile(&mut saved.launch_presets, profile, "example/test", portable).unwrap();
+    assert!(saved.launch("example/test", false).scarlett_shader_pass);
+    let old: LaunchPreset = decode(r#"{"name":"Classic","args":"--old","switches":null}"#).unwrap();
+    assert!(LaunchMethod::Program.accepts(&old));
+}
+
+#[cfg(test)]
+#[test]
 fn shared_presets_preserve_quotes_empty_overrides_and_duplicate_names() {
     let original = LaunchPreset {
+        method: None,
+        nvidia: None,
         name: "Scarlett".into(),
         args: r#"--strict -- -name "two words""#.into(),
         switches: Some(String::new()),
@@ -656,40 +596,12 @@ fn shared_presets_preserve_quotes_empty_overrides_and_duplicate_names() {
 
 #[cfg(test)]
 #[test]
-fn deleting_another_preset_keeps_the_selected_switches() {
-    let mut presets = Vec::new();
-    for name in ["First", "Scarlett", "Third"] {
-        store(
-            &mut presets,
-            LaunchPreset {
-                name: name.into(),
-                args: String::new(),
-                switches: Some("VICTORY_ASYNC_SUBMIT=1\nVICTORY_AMBIENT=".into()),
-                script_options: None,
-                projects: Vec::new(),
-                repo_script: None,
-            },
-        )
-        .unwrap();
-    }
-    let mut picker = Picker::default();
-    picker.select(Some("Scarlett".into()));
-    presets.retain(|preset| preset.name != "First");
-    let json = encode(picker.preset(&presets).unwrap()).unwrap();
-    assert_eq!(
-        decode(&json).unwrap().switches.as_deref(),
-        Some("VICTORY_ASYNC_SUBMIT=1\nVICTORY_AMBIENT=")
-    );
-    presets.retain(|preset| preset.name != "Scarlett");
-    assert!(picker.preset(&presets).is_none());
-}
-
-#[cfg(test)]
-#[test]
 fn accepting_a_detected_preset_saves_it_to_the_profile_without_duplicates() {
     let mut presets = Vec::new();
     let mut launch = ProjectLaunch::default();
     let preset = LaunchPreset {
+        method: None,
+        nvidia: None,
         name: "play-scarlett".into(),
         args: String::new(),
         switches: Some("VICTORY_ASYNC_SUBMIT=1".into()),
@@ -720,6 +632,8 @@ if (-not $NoProbeRays -and -not $RayTracing) { $set.VICTORY_PROBE_RAYS = '1' }",
     )
     .unwrap();
     let detected = LaunchPreset {
+        method: None,
+        nvidia: None,
         name: "play-scarlett".into(),
         args: String::new(),
         switches: Some(switches),

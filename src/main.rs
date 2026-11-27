@@ -69,6 +69,7 @@ struct Project {
 
 mod build_zip;
 mod rust_project;
+mod nvidia_rt;
 
 impl Project {
     fn is_git(&self) -> bool {
@@ -137,6 +138,10 @@ struct Saved {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct LaunchPreset {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    method: Option<LaunchMethod>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    nvidia: Option<NvidiaPreset>,
     name: String,
     args: String,
     switches: Option<String>,
@@ -148,8 +153,36 @@ struct LaunchPreset {
     repo_script: Option<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LaunchMethod { Program, Victory, Nvidia }
+
+impl LaunchMethod {
+    fn for_project(project: &Project, native: bool) -> Self {
+        if project.runs_standalone() { Self::Program } else if native { Self::Nvidia } else { Self::Victory }
+    }
+
+    fn accepts(self, preset: &LaunchPreset) -> bool {
+        preset.method.is_none_or(|method| method == self)
+            && (preset.nvidia.is_none() || self == Self::Nvidia)
+            && (preset.switches.is_none() || self != Self::Program)
+    }
+}
+
 impl LaunchPreset {
+    fn matches_profile(&self, profile: &ProjectLaunch, args: &str, switches: &str, graphics: GraphicsSettings) -> bool {
+        self.args == profile.args.as_deref().unwrap_or(args)
+            && self.switches.as_deref().is_none_or(|value| value == profile.switches.as_deref().unwrap_or(switches)
+                && self.script_options == profile.script_options)
+            && self.nvidia.as_ref().is_none_or(|native| native.graphics == profile.graphics.unwrap_or(graphics)
+                && native.baseline == profile.nvidia_plain)
+    }
+
     fn apply(&self, launch: &mut ProjectLaunch) {
+        if let Some(native) = &self.nvidia {
+            launch.graphics = Some(native.graphics);
+            launch.nvidia_plain = native.baseline;
+        }
         launch.args = Some(self.args.clone());
         if let Some(switches) = &self.switches {
             launch.switches = Some(switches.clone());
@@ -158,7 +191,10 @@ impl LaunchPreset {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+struct NvidiaPreset { graphics: GraphicsSettings, baseline: bool }
+
+#[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ProjectLaunch {
     args: Option<String>,
@@ -170,6 +206,10 @@ struct ProjectLaunch {
     /// Records a custom script accepted by an earlier build.
     confirmed_repo_script: Option<String>,
     graphics: Option<GraphicsSettings>,
+    nvidia_defaults_initialized: bool,
+    nvidia_plain: bool,
+    pending_setup: bool,
+    nvidia_reviewed_revision: Option<String>,
     notes: String,
 }
 
@@ -232,6 +272,25 @@ impl OutputResolution {
 }
 
 impl Saved {
+    fn queue_project_setup(&mut self, project: &Project) {
+        self.initialize_nvidia_profile(project);
+        self.project_launch.entry(project_key(&project.repo)).or_default().pending_setup = true;
+    }
+
+    fn initialize_nvidia_profile(&mut self, project: &Project) {
+        let key = project_key(&project.repo);
+        if self.project_launch.get(&key).is_some_and(|p| p.nvidia_defaults_initialized)
+            || !nvidia_rt::supported(&project_script_root(project)) { return; }
+        let profile = self.project_launch.entry(key).or_default();
+        profile.graphics.get_or_insert(GraphicsSettings {
+            series_s: false, render_scale: 1.0, fix_8gb: false, bright_shadows: false,
+            fullscreen: true, output: OutputResolution::Default,
+        });
+        // The native play subcommand takes different arguments from the global run subcommand.
+        profile.args.get_or_insert_with(String::new);
+        profile.nvidia_defaults_initialized = true;
+    }
+
     fn launch(&self, repo: &str, scarlett_shader_pass: bool) -> Launch {
         let settings = self.project_launch.get(&project_key(repo));
         let (args, extra) = self.launch_overrides(repo);
@@ -243,12 +302,13 @@ impl Saved {
             output: graphics.output,
             extra,
             use_script_defaults: settings.is_some_and(|s| s.switches.is_some() && s.script_options.is_some()),
-            scarlett_shader_pass,
+            scarlett_shader_pass: scarlett_shader_pass || settings.and_then(|s| s.script_options).is_some_and(|options| options.shader_pass),
             fullscreen: graphics.fullscreen,
             warm_first: self.warm_before_play,
             pipelines: self.warm_pipelines,
             args,
             program_args: settings.and_then(|s| s.args.as_deref()).map(split_args).unwrap_or_default(),
+            nvidia_plain: settings.is_some_and(|s| s.nvidia_plain),
         }
     }
 
@@ -275,8 +335,7 @@ impl Saved {
         }
         launch.script_options = Some(options);
         preset.script_options = Some(options);
-        let shader_pass = source.lines().any(|line| line.trim().eq_ignore_ascii_case("& $Victory shaders $rpf"));
-        Ok(Some((format!("{name}.ps1"), shader_pass)))
+        Ok(Some((format!("{name}.ps1"), options.shader_pass)))
     }
 
     fn default_graphics(&self) -> GraphicsSettings {
@@ -436,6 +495,7 @@ struct Launch {
     pipelines: bool,
     args: Vec<String>,
     program_args: Vec<String>,
+    nvidia_plain: bool,
 }
 
 /// The game files `victory translate --cache` reads shaders from (those that exist are passed).
@@ -500,6 +560,7 @@ struct App {
     confirm_uninstall: Option<String>,
     save_picker: Option<ui::SavePicker>,
     play_preset_picker: Option<ui::PlayPresetPicker>,
+    native_setup: Option<ui::NativeSetup>,
     /// A new install folder waiting for "move the projects there?" (from, to).
     pending_move: Option<(PathBuf, PathBuf)>,
     /// The folder the files were checked in was empty.
@@ -538,6 +599,7 @@ struct App {
 
 #[derive(Clone, Copy, PartialEq)]
 enum View {
+    Presets,
     Projects,
     Settings,
     Library,
@@ -640,6 +702,7 @@ fn project_checks_distinguish_manual_results_and_ignore_replaced_requests() {
 #[derive(Clone, PartialEq)]
 enum Kind {
     Install,
+    InstallDlss,
     Play(saves::LaunchSave),
     Uninstall,
     /// Shaders into the cache ahead of time, without playing.
@@ -753,6 +816,7 @@ fn finds_a_unique_nested_victory_workspace_and_prefers_the_root() {
 
 /// Checks a cloned repo's Cargo.toml for a custom build profile (e.g. `diag`).
 fn detect_build_profile(repo_dir: &Path) -> &'static str {
+    if nvidia_rt::supported(repo_dir) { return "release"; }
     let cargo_toml = repo_dir.join("Cargo.toml");
     if let Ok(text) = std::fs::read_to_string(&cargo_toml) {
         if text.contains("[profile.diag]") {
@@ -1196,6 +1260,7 @@ impl App {
             confirm_uninstall: None,
             save_picker: None,
             play_preset_picker: None,
+            native_setup: None,
             pending_move: None,
             empty: false,
             finding: Arc::new(Mutex::new(None)),
@@ -1346,10 +1411,13 @@ impl App {
                     .reviewed_script_revision.get_or_insert(revision);
             }
         }
-        if kind == Kind::Install || kind == Kind::Warm {
+        if matches!(kind, Kind::Install | Kind::InstallDlss | Kind::Warm) {
             self.show_log = true;
         }
         self.log_export_status = None;
+        if matches!(kind, Kind::Play(_) | Kind::Warm) {
+            self.saved.initialize_nvidia_profile(&p);
+        }
         let script = if matches!(kind, Kind::Play(_) | Kind::Warm) {
             self.saved.refresh_repo_preset(&p)
         } else { Ok(None) };
@@ -1375,11 +1443,14 @@ impl App {
         std::thread::spawn(move || {
             let r = match &kind {
                 Kind::Install => install(&job, &ctx, &p, updating),
+                Kind::InstallDlss => project_exe(&p).and_then(|exe| {
+                    stage(&job, &ctx, "Downloading NVIDIA Streamline for DLSS and frame generation");
+                    run(&job, &ctx, Command::new(exe).arg("get-dlss").current_dir(project_script_root(&p)).stdin(Stdio::null()))
+                }),
                 Kind::Play(choice) => play(&job, &ctx, &p, &launch, choice),
                 Kind::Uninstall => uninstall(&job, &ctx, &p),
                 Kind::Warm => project_exe(&p).and_then(|exe| {
-                    let mut command = Command::new(exe);
-                    victory_env(&mut command, &p, &launch);
+                    let command = game_command(&exe, &p, &launch)?;
                     warm(&job, &ctx, &command, &launch)
                 }),
             };
@@ -1408,7 +1479,7 @@ impl App {
                 match r {
                     _ if j.stopped => j.stage = "Stopped".into(),
                     Ok(()) => {
-                        if kind == Kind::Install && updating {
+                        if kind == Kind::Install {
                             j.updated_project = Some(p.clone());
                         }
                         if kind == Kind::Uninstall && p.archive_exe.is_some() {
@@ -1417,6 +1488,7 @@ impl App {
                         j.stage = match kind {
                             Kind::Install if updating => "Updated: ready to play".into(),
                             Kind::Install => "Installed: ready to play".into(),
+                            Kind::InstallDlss => "NVIDIA DLSS files ready".into(),
                             Kind::Play(_) => if p.runs_standalone() { "Program closed".into() } else { "Game closed".into() },
                             Kind::Uninstall => "Uninstalled".into(),
                             Kind::Warm => "Shaders warmed up: ready to play".into(),
@@ -1433,7 +1505,7 @@ impl App {
                         j.log.push(format!("ERROR: {e}"));
                     }
                 }
-                let action=match kind{Kind::Play(_)=>"Play",Kind::Install if updating=>"Update",Kind::Install=>"Install",Kind::Warm=>"Shader warm-up",Kind::Uninstall=>"Uninstall"};
+                let action=match kind{Kind::Play(_)=>"Play",Kind::Install if updating=>"Update",Kind::Install=>"Install",Kind::InstallDlss=>"NVIDIA DLSS setup",Kind::Warm=>"Shader warm-up",Kind::Uninstall=>"Uninstall"};
                 j.log.save_session(&p.name,action);
             }
             ctx.request_repaint();
@@ -1504,6 +1576,11 @@ fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &
     cargo.current_dir(&workspace);
     if victory {
         cargo.args(["-p", "victory"]);
+        if nvidia_rt::supported(&workspace) && nvidia_rt::needs_agility()? {
+            stage(job, ctx, "Preparing Microsoft D3D12 Agility for the Windows 10 build");
+            nvidia_rt::install_agility(&target.join(profile))?;
+            cargo.args(["--features", "agility"]);
+        }
         // Scarlett's diag profile and Cargo's diagnostics feature are separate switches.
         if profile == "diag"
             && metadata["packages"].as_array().is_some_and(|packages| packages.iter().any(|pkg|
@@ -1843,7 +1920,11 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, base: &Command, l: &Launch) 
 }
 
 /// Starts the installed build of `p`, warming its shaders first when the player asked for that.
-fn game_command(exe: &Path, p: &Project, l: &Launch) -> Command {
+fn game_command(exe: &Path, p: &Project, l: &Launch) -> Result<Command, String> {
+    let root = project_script_root(p);
+    if nvidia_rt::supported(&root) {
+        return nvidia_rt::command(exe, &root, &p.repo, l);
+    }
     let mut c = Command::new(exe);
     c.arg("run").arg(l.game_dir.join(EXE_NAME)).arg("--execute");
     let explicit_console = l.args.iter().take_while(|arg| arg.as_str() != "--")
@@ -1853,7 +1934,7 @@ fn game_command(exe: &Path, p: &Project, l: &Launch) -> Command {
     }
     c.args(&l.args);
     victory_env(&mut c, p, l);
-    c
+    Ok(c)
 }
 
 fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, choice: &saves::LaunchSave) -> Result<(), String> {
@@ -1885,7 +1966,7 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
         if l.warm_first { "on" } else { "off" },
         if l.warm_first && l.pipelines { "yes" } else { "no" },
     ));
-    let mut c = game_command(&exe, p, l);
+    let mut c = game_command(&exe, p, l)?;
     let project_data = workspace().join("data").join(slug(&p.repo));
     let data = saves::prepare(&project_data, choice).map_err(|error| format!("Could not prepare saves: {error}"))?;
     if data != project_data {
@@ -1915,8 +1996,13 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
             })
         });
         job.log.report(format!("Configured graphics profile: {}", if l.series_s { "Series S" } else { "Series X" }));
-        job.log.report(format!("Console passed to VIctory: {}", console.unwrap_or("build default (no --console argument)")));
-        job.log.report(format!("Configured render scale: {:.0}%", l.scale * 100.0));
+        if args.first().is_some_and(|arg| *arg == "play") {
+            job.log.report(format!("Native NVIDIA play mode ({}). Saved F1 choices can override console, resolution, DLSS and frame cap.",
+                if l.nvidia_plain { "Plain" } else { "installed PLAY.cmd Fast settings" }));
+        } else {
+            job.log.report(format!("Console passed to VIctory: {}", console.unwrap_or("build default (no --console argument)")));
+            job.log.report(format!("Configured render scale: {:.0}%", l.scale * 100.0));
+        }
         job.log.report(format!("Configured output resolution: {}", l.output.label()));
         job.log.report(format!("Borderless fullscreen: {}", if l.fullscreen { "on" } else { "off" }));
         let save_choice = match choice {
@@ -2022,13 +2108,8 @@ impl eframe::App for App {
                 }
                 (job.imported_project.take(), job.removed_archive.take(), job.updated_project.take())
             };
-            if let Some(project) = updated.filter(|project|
-                self.view == View::Projects && self.saved.selected.as_ref() == Some(&project.repo)
-                && self.screenshot_projects.is_none() && self.add_repo.is_none() && self.confirm_uninstall.is_none()
-                && self.pending_move.is_none() && self.play_preset_picker.is_none() && self.save_picker.is_none()
-            ) {
-                let launch = self.saved.project_launch.get(&project_key(&project.repo));
-                self.play_preset_picker = ui::PlayPresetPicker::after_project_update(&project, &self.saved.launch_presets, launch);
+            if let Some(project) = updated {
+                self.saved.queue_project_setup(&project);
             }
             if let Some(project) = imported {
                 if self.import_focus.as_ref().is_some_and(|(repo, _, _)| repo == &project.repo) {

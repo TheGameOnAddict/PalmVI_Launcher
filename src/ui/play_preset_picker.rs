@@ -16,6 +16,7 @@ pub(crate) struct PlayPresetPicker {
 }
 
 impl PlayPresetPicker {
+    pub(super) fn has_scripts(&self) -> bool { self.options.iter().any(|p| p.repo_script.is_some()) }
     pub(super) fn for_project(
         project: &Project,
         saved: &[LaunchPreset],
@@ -35,7 +36,7 @@ impl PlayPresetPicker {
         let had_script = picker.previous_script(saved, launch).is_some();
         if updated {
             if !had_script && !picker.options.iter().any(|p| p.repo_script.is_some()) { return None; }
-        } else if picker.recommended.is_none() && picker.options.len() < 2 {
+        } else if picker.options.is_empty() {
             return None;
         }
         Some(picker)
@@ -59,15 +60,11 @@ impl PlayPresetPicker {
             .and_then(|p| p.repo_script.as_deref()).or(launch.confirmed_repo_script.as_deref())
     }
 
-    pub(super) fn recommended_script(&self) -> Option<LaunchPreset> {
-        self.recommended.map(|i| self.options[i].clone())
-    }
 
     fn scan(project: &Project, saved: &[LaunchPreset], launch: Option<&ProjectLaunch>, revision: Option<String>,
         settings_only: bool, after_update: bool, folder: &Path) -> Self {
         let standalone = project.runs_standalone();
-        let repo = project_key(&project.repo);
-        let mut options = if standalone {
+        let options = if standalone {
             Vec::new()
         } else {
             scripts(folder, &project.name)
@@ -76,16 +73,6 @@ impl PlayPresetPicker {
             .first()
             .filter(|preset| is_custom_script(&preset.name))
             .map(|_| 0);
-        options.extend(
-            saved
-                .iter()
-                .filter(|preset| {
-                    !settings_only && preset.projects.contains(&repo)
-                        && (!standalone || preset.switches.is_none())
-                        && preset.repo_script.is_none()
-                })
-                .cloned(),
-        );
         let mut picker = Self {
             project: project.clone(),
             options,
@@ -107,7 +94,7 @@ impl PlayPresetPicker {
     pub(super) fn show(&mut self, ctx: &egui::Context, opened_at: f64) -> (bool, bool) {
         let mut cancelled = false;
         let (accepted, dismissed) = theme::modal(ctx, "play-preset", opened_at, 460.0, |ui| {
-            theme::title(ui, if self.settings_only || self.after_update { "Review launch scripts" } else { "Choose launch preset" }, 36.0, 460.0);
+            theme::title(ui, if self.settings_only || self.after_update { "Project launch scripts" } else { "Choose project settings" }, 36.0, 460.0);
             note(
                 ui,
                 if self.options.iter().all(|p| p.repo_script.is_none()) && (self.settings_only || self.after_update) {
@@ -115,8 +102,8 @@ impl PlayPresetPicker {
                 } else if self.after_update {
                     "This project was updated. Choose a script from the installed build or keep your current values."
                 } else if self.settings_only {
-                    "Choose a script from the current installation to use for this profile."
-                } else { "Confirm once to save your launch settings for this profile." },
+                    "Choose a script to read its launch settings into this project."
+                } else { "Choose which settings Play will use. You can change this later in Launch settings." },
             );
             ui.add_space(10.0);
             egui::ScrollArea::vertical()
@@ -138,7 +125,7 @@ impl PlayPresetPicker {
                     for (index, preset) in self.options.iter().enumerate() {
                         let (title, detail) = match preset.repo_script.as_deref() {
                             Some(script) if is_custom_script(script) => (
-                                "Detected custom script",
+                                script,
                                 if self.recommended == Some(index) {
                                     format!("{script}.ps1 · Recommended for this build")
                                 } else {
@@ -146,7 +133,7 @@ impl PlayPresetPicker {
                                 },
                             ),
                             Some(script) => (
-                                "Standard repo launch",
+                                "Standard project script",
                                 format!("{script}.ps1 · Use the repository’s standard settings"),
                             ),
                             None => (preset.name.as_str(), "Use this saved preset.".into()),
@@ -162,12 +149,12 @@ impl PlayPresetPicker {
                 if self.selected.is_some() { "Apply to profile" } else { "Keep current values" }
             } else if self.project.runs_standalone() {
                 if self.selected.is_some() {
-                    "Apply preset and launch"
+                    "Use settings and launch"
                 } else {
                     "Launch with current settings"
                 }
             } else if self.selected.is_some() {
-                "Apply preset and choose save"
+                "Use settings and choose save"
             } else {
                 "Choose save with current settings"
             };
@@ -188,11 +175,8 @@ impl PlayPresetPicker {
     }
 }
 
-pub(super) fn detected_preset(project: &Project) -> Option<LaunchPreset> {
+pub(super) fn detected_scripts(project: &Project) -> Vec<LaunchPreset> {
     scripts(&project_script_root(project).join("scripts"), &project.name)
-        .into_iter()
-        .next()
-        .filter(|preset| is_custom_script(&preset.name))
 }
 
 fn choice_card(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool) -> bool {
@@ -235,6 +219,7 @@ fn is_custom_script(stem: &str) -> bool {
 }
 
 fn scripts(folder: &Path, project_name: &str) -> Vec<LaunchPreset> {
+    if folder.parent().is_some_and(crate::nvidia_rt::supported) { return Vec::new(); }
     let mut files: Vec<_> = std::fs::read_dir(folder)
         .into_iter()
         .flatten()
@@ -345,6 +330,8 @@ fn accepting_current_settings_or_a_preset_skips_future_prompts() {
         archive_exe: None,
     };
     let presets = ["First", "Second"].map(|name| LaunchPreset {
+        method: None,
+        nvidia: None,
         name: name.into(),
         args: String::new(),
         switches: None,
@@ -352,7 +339,7 @@ fn accepting_current_settings_or_a_preset_skips_future_prompts() {
         projects: vec![project.repo.clone()],
         repo_script: None,
     });
-    assert!(PlayPresetPicker::for_project(&project, &presets, None).is_some());
+    assert!(PlayPresetPicker::for_project(&project, &presets, None).is_none());
     let current = ProjectLaunch {
         preset_choice_confirmed: true,
         ..ProjectLaunch::default()

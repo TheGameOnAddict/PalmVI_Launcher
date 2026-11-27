@@ -758,7 +758,7 @@ pub fn modal<R>(ctx: &egui::Context, id: &str, opened_at: f64, width: f32, add: 
     }
     let screen = ctx.screen_rect();
     let dim = egui::Area::new(Id::new(id).with("dim"))
-        .order(egui::Order::Foreground)
+        .order(egui::Order::Middle)
         .fixed_pos(screen.min)
         .constrain(false)
         .show(ctx, |ui| {
@@ -768,7 +768,7 @@ pub fn modal<R>(ctx: &egui::Context, id: &str, opened_at: f64, width: f32, add: 
         })
         .inner;
     let inner = egui::Area::new(Id::new(id))
-        .order(egui::Order::Tooltip)
+        .order(egui::Order::Foreground)
         .default_size(vec2(width+58.0,screen.height()-26.0))
         .anchor(Align2::CENTER_CENTER, vec2(0.0, -8.0 * (1.0 - a)))
         .show(ctx, |ui| {

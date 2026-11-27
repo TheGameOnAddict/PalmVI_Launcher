@@ -41,6 +41,7 @@ fn updates_installed_defaults_and_keeps_profile_edits() {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Options {
+    pub shader_pass: bool,
     pub ray_tracing: bool,
     pub probe_rays: bool,
     pub probe_rays_single_switch: bool,
@@ -131,6 +132,7 @@ pub fn parse(script: &str) -> Result<(String, Options), String> {
         defaults.insert("VICTORY_PROBE_RAYS", "1");
     }
     let options = Options {
+        shader_pass: after.iter().any(|line| line.eq_ignore_ascii_case("& $Victory shaders $rpf")),
         ray_tracing: has_flag(after, &prefix, &["if($raytracing)"], RAY_TRACING),
         probe_rays: probe_rays_single_switch
             || has_flag(
@@ -292,7 +294,8 @@ if ($AutoStart) { $set.VICTORY_AUTO_INPUT = '1' }
             ray_tracing: true,
             probe_rays: true,
             probe_rays_single_switch: false,
-            hooks: true
+            hooks: true,
+            shader_pass: false,
         }
     );
     assert_eq!(

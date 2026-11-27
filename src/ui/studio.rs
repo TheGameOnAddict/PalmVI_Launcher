@@ -63,6 +63,7 @@ fn view_name(view: View) -> &'static str {
         View::Projects => "Project profile",
         View::Settings => "Global settings",
         View::Library => "Library",
+        View::Presets => "Presets",
         View::Discover => "Discover",
         View::Activity => "Activity",
         View::System => "Your system",
@@ -210,7 +211,15 @@ impl App {
                             View::Projects => self.page(ui, ctx, self.selected_project()),
                             View::Library | View::Discover => self.catalog(ui, ctx),
                             View::Settings => self.settings_page(ui, ctx),
-                            View::Activity => self.activity_page(ui),
+                            View::Activity | View::Presets => {
+                                let index = usize::from(self.view == View::Presets);
+                                if let Some(tab) = theme::segmented(ui, "activity-presets-tabs", &["Activity", "Presets"], Some(index), Some(238.0)) {
+                                    self.view = if tab == 0 { View::Activity } else { View::Presets };
+                                }
+                                ui.add_space(12.0);
+                                if self.view == View::Activity { self.activity_page(ui); }
+                                else { launch_presets::manager::show(ui, &mut self.saved); }
+                            }
                             View::System => {
                                 egui::ScrollArea::vertical().show(ui, |ui| self.hardware.show(ui));
                             }
@@ -299,7 +308,8 @@ impl App {
             (View::Activity, '\u{E9EC}'),
         ] {
             let active =
-                self.view == view || (view == View::Library && self.view == View::Projects);
+                self.view == view || (view == View::Library && self.view == View::Projects)
+                    || (view == View::Activity && self.view == View::Presets);
             let count = if view == View::Library {
                 Some(self.library_projects().len())
             } else if view == View::Activity {
@@ -313,7 +323,8 @@ impl App {
             } else {
                 None
             };
-            if widgets::nav_item(ui, view_name(view), icon, active, count).clicked() {
+            let label = if view == View::Activity { "Activity / Presets" } else { view_name(view) };
+            if widgets::nav_item(ui, label, icon, active, count).clicked() {
                 self.view = view;
             }
         }

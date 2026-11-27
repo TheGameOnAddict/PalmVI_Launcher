@@ -44,6 +44,14 @@ Open **Other graphics settings** to choose a **Series X** or **Series S** profil
 
 The project shows **Using global** or **Overrides global** so you can see which settings are active. Select **Use global settings** to clear a project's graphics override.
 
+## NVIDIA RT source builds
+
+Import the NVIDIA RT Git repository and choose **Install**. PalmVI builds its release profile and passes the configured game path to the fork’s native launcher. The initial project graphics use Series X, 1440p and borderless fullscreen. Choose **Installation → Install NVIDIA DLSS files** to download optional Streamline components from NVIDIA. On Windows 10, installation also provisions the Microsoft D3D12 Agility runtime beside the build.
+
+After install or update, PalmVI detects the project’s launch settings and opens a setup dialog. Choose a console profile and either **Recommended optimizations** or **Baseline**. Tuning works with either console. You can also choose resolution, DLSS, frame generation, frame limit and display options. **Save choices** applies them to the project. **Decide later** keeps the existing choices.
+
+Reopen the same controls in **Launch settings**. **Save profile as preset** makes a named copy of your configuration, including graphics, tuning, arguments and switches, for later use or export. Advanced arguments remain available. Use **F1** for the fork’s saved settings and **F3** for its performance panel. Saved F1 choices can override the starting console, resolution, DLSS and frame rate. PalmVI keeps using the selected save and the project’s shader cache.
+
 ## Save picker
 
 For VIctory builds, **Play** opens the save picker. Continue a save, start fresh, copy an earlier
@@ -68,7 +76,7 @@ keeps the files under `deleted-saves` in its install folder for recovery.
 - **ZIP builds:** choose **Import Repo/Zip → Import build ZIP…** to import a prebuilt Windows executable and its bundled files. PalmVI uses its normal game launch flow for `victory.exe`.
 - **Activity log:** use **Export log…** to share the launch report and full captured output. The report includes the executable, arguments, console settings, effective `VICTORY_*` switches, and shader and pipeline warm-up results.
 - **Scarlett launch presets** follow the installed script's defaults while preserving profile edits. Warm-up and Play use the same working directory, switches, cache and save folder. With warm-up enabled, Activity shows whether the shader pass ran, reused the cache, or encountered a problem. Pipeline warm-up has its own result in the exported log.
-- **Rescan scripts** in **Launch settings → Saved presets** to choose from the installed project's supported PowerShell launch scripts. After a project update, PalmVI offers a fresh selection and remembers it for that revision. Re-selecting the same script preserves your profile edits.
+- **Launch settings** lists scripts detected in the selected project. Choose **Use script settings** to apply one, or **Save a copy** to add it to your personal presets. **Rescan** refreshes the list.
 - **Project updates** pulse yellow on the project's **Check for updates** button. Selecting a project with an available update or finding one through a manual check opens **Overview**, where you can choose **Update now**.
 - **Parallel installs and updates** let you start another project's install, update, or ZIP import while one is running. The bottom bar counts active installs and updates. Select a project to see its progress and copy or export its Activity log.
 - **Install once, play many times:** a project is downloaded and built on your PC once and stays installed.
@@ -77,8 +85,8 @@ keeps the files under `deleted-saves` in its install folder for recovery.
 - **Uninstall:** removes a project's download, build and shader cache (saves stay).
 - **Game files check:** choose your game files folder to enable Play on VIctory builds.
 - **Project profiles** keep launch arguments, environment switches, and private notes for each build.
-- **Launch presets** are in **Launch Settings**. Paste raw arguments and switches into the project fields, then use **Save as preset…** to save both under a name. In **Saved presets**, apply or delete an existing preset, or use **Import file…** or **Paste preset text…** to add one someone shared.
-- **PowerShell presets** read literal `VICTORY_*` defaults from scripts such as `play-scarlett.ps1`. PalmVI preselects a detected custom script in **Launch Settings** and offers it the first time you press **Play**. Confirm your choice once and PalmVI uses those profile settings on later launches. Applying the script exposes any recognized Ray tracing, Probe rays, and Hooks toggles. Use **Import file…** to select another script.
+- **My presets** sits beside the detected settings in each project’s **Launch settings**. Click a compatible preset card to review its settings, then choose **Use for this project**, or enter a name and choose **Save profile as preset** to keep a copy of your current settings. The **Presets** tab under **Activity / Presets** lets you create, edit, rename, import, export and delete presets, even before you install a project.
+- **Project scripts** supply launch defaults independently of your personal preset library. PalmVI reads supported literal settings from PowerShell scripts and recognizes supported Play CMD wrappers. Applying script settings exposes recognized Ray tracing, Probe rays and Hooks controls. You can save those choices as a personal preset.
 - **Build tracking:** see when you last ran a build and spot installs and updates you have yet to try.
 - **Sharing mode** replaces repo names and links with examples and hides private details such as paths, notes, and logs.
 - **Compatibility:** build forks with a nested Cargo workspace and use shader warm-up on Scarlett builds that provide the `shaders` command.
