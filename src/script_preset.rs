@@ -1,17 +1,66 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+/// Update a detected preset without losing local additions, overrides or removals.
+pub fn refresh_defaults(previous: &str, current: &str, profile: &str) -> String {
+    fn entries(text: &str) -> BTreeMap<&str, &str> {
+        text.lines().filter_map(|line| line.split_once('='))
+            .map(|(k, v)| (k.trim(), v.trim())).collect()
+    }
+    let old = entries(previous);
+    let new = entries(current);
+    let local = entries(profile);
+    let user_set_probe_rays = local.contains_key("VICTORY_PROBE_RAYS");
+    let mut merged = new;
+    for key in old.keys() {
+        if !local.contains_key(key) { merged.remove(key); }
+    }
+    for (key, value) in local {
+        if old.get(key) != Some(&value) {
+            merged.insert(key, value);
+        }
+    }
+    // Scarlett only enables default probe rays when ray tracing is off.
+    if merged.get("VICTORY_BVH_BUILDER") == Some(&"1") && !user_set_probe_rays {
+        merged.remove("VICTORY_PROBE_RAYS");
+    }
+    merged.into_iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join("\n")
+}
+
+#[cfg(test)]
+#[test]
+fn updates_installed_defaults_and_keeps_profile_edits() {
+    let old = "VICTORY_A=1\nVICTORY_B=2\nVICTORY_C=3\nVICTORY_D=4";
+    let new = "VICTORY_A=9\nVICTORY_B=9\nVICTORY_C=9\nVICTORY_PROBE_RAYS=1";
+    let local = "VICTORY_A=1\nVICTORY_B=7\nVICTORY_D=4\nVICTORY_E=0";
+    assert_eq!(refresh_defaults(old, new, local), "VICTORY_A=9\nVICTORY_B=7\nVICTORY_E=0\nVICTORY_PROBE_RAYS=1");
+    assert!(!refresh_defaults(old, new, &format!("{local}\nVICTORY_BVH_BUILDER=1")).contains("PROBE_RAYS"));
+    assert!(refresh_defaults(old, new, &format!("{local}\nVICTORY_PROBE_RAYS=0")).contains("VICTORY_PROBE_RAYS=0"));
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Options {
     pub ray_tracing: bool,
     pub probe_rays: bool,
+    pub probe_rays_single_switch: bool,
     pub hooks: bool,
 }
 
 pub const RAY_TRACING: &[&str] = &["VICTORY_BVH_BUILDER"];
-pub const PROBE_RAYS: &[&str] = &["VICTORY_ACTIVATE_RAYS", "VICTORY_RT_RESOLVE"];
+const LEGACY_PROBE_RAYS: &[&str] = &["VICTORY_ACTIVATE_RAYS", "VICTORY_RT_RESOLVE"];
+const SINGLE_PROBE_RAYS: &[&str] = &["VICTORY_PROBE_RAYS"];
 pub const HOOKS: &[&str] = &["VICTORY_GPU_ONLY", "VICTORY_KNOWN_WRITES"];
+
+impl Options {
+    pub fn probe_keys(self) -> &'static [&'static str] {
+        if self.probe_rays_single_switch {
+            SINGLE_PROBE_RAYS
+        } else {
+            LEGACY_PROBE_RAYS
+        }
+    }
+}
 
 /// Read a literal launch hashtable and recognize the supported Scarlett flag mappings.
 pub fn parse(script: &str) -> Result<(String, Options), String> {
@@ -41,7 +90,7 @@ pub fn parse(script: &str) -> Result<(String, Options), String> {
         .position(|line| *line == "}")
         .ok_or("Could not find the end of the launch hashtable.")?
         + start;
-    let defaults: BTreeMap<_, _> = lines[start..end]
+    let mut defaults: BTreeMap<_, _> = lines[start..end]
         .iter()
         .flat_map(|line| assignments(line))
         .filter_map(|assignment| literal_assignment(assignment, None))
@@ -57,14 +106,40 @@ pub fn parse(script: &str) -> Result<(String, Options), String> {
     }
     let prefix = format!("{variable}.");
     let after = &lines[end + 1..];
-    let options = Options {
-        ray_tracing: has_flag(after, &prefix, &["if($raytracing)"], RAY_TRACING),
-        probe_rays: has_flag(
+    // Standard play.ps1 has a -Safe branch and an else block for normal launches.
+    if let Some(start) = after.iter().position(|line| *line == "if ($Safe) {") {
+        let mut body = after[start + 1..].iter().copied().skip_while(|line| !line.starts_with('}'));
+        if body.next() == Some("} else {") {
+            defaults.extend(body.take_while(|line| *line != "}").flat_map(assignments)
+                .filter_map(|part| literal_assignment(part, Some(&prefix))));
+        }
+    }
+    let probe_rays_by_default = has_flag(
+        after,
+        &prefix,
+        &["if(-not$noproberays-and-not$raytracing)"],
+        SINGLE_PROBE_RAYS,
+    );
+    let probe_rays_single_switch = probe_rays_by_default
+        || has_flag(
             after,
             &prefix,
             &["if($proberays-and-not$raytracing)"],
-            PROBE_RAYS,
-        ),
+            SINGLE_PROBE_RAYS,
+        );
+    if probe_rays_by_default && defaults.get("VICTORY_BVH_BUILDER") != Some(&"1") {
+        defaults.insert("VICTORY_PROBE_RAYS", "1");
+    }
+    let options = Options {
+        ray_tracing: has_flag(after, &prefix, &["if($raytracing)"], RAY_TRACING),
+        probe_rays: probe_rays_single_switch
+            || has_flag(
+                after,
+                &prefix,
+                &["if($proberays-and-not$raytracing)"],
+                LEGACY_PROBE_RAYS,
+            ),
+        probe_rays_single_switch,
         hooks: has_flag(
             after,
             &prefix,
@@ -202,6 +277,7 @@ $set = [ordered]@{
     VICTORY_VALUE = 'a;b#c' # comment; VICTORY_IGNORED = '1'
     VICTORY_DYNAMIC = "$value"
 }
+
 if ($Hooks -and -not $NoHooks) {
     $set.VICTORY_GPU_ONLY = '1'; $set.VICTORY_KNOWN_WRITES = '1'
 }
@@ -215,6 +291,7 @@ if ($AutoStart) { $set.VICTORY_AUTO_INPUT = '1' }
         Options {
             ray_tracing: true,
             probe_rays: true,
+            probe_rays_single_switch: false,
             hooks: true
         }
     );
@@ -222,14 +299,28 @@ if ($AutoStart) { $set.VICTORY_AUTO_INPUT = '1' }
         switches,
         "VICTORY_CARD_AWAKE=0\nVICTORY_JOIN_COPIES=1\nVICTORY_VALUE=a;b#c"
     );
-    set_enabled(&mut switches, PROBE_RAYS, true);
-    assert!(enabled(&switches, PROBE_RAYS));
-    set_enabled(&mut switches, PROBE_RAYS, false);
-    assert!(!enabled(&switches, PROBE_RAYS));
+    set_enabled(&mut switches, options.probe_keys(), true);
+    assert!(enabled(&switches, options.probe_keys()));
+    set_enabled(&mut switches, options.probe_keys(), false);
+    assert!(!enabled(&switches, options.probe_keys()));
     assert_eq!(switches.matches("VICTORY_RT_RESOLVE=").count(), 1);
     assert_eq!(
         parse("$settings = @{\nVICTORY_LOG = 'warn'\n}").unwrap().1,
         Options::default()
     );
     assert!(parse("Write-Host 'No launch hashtable'").is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn recognizes_new_scarlett_probe_rays_switch_and_its_default() {
+    let script = "$set = [ordered]@{\nVICTORY_LOG = 'warn'\n}\n\
+if (-not $NoProbeRays -and -not $RayTracing) { $set.VICTORY_PROBE_RAYS = '1' }";
+    let (mut switches, options) = parse(script).unwrap();
+    assert!(options.probe_rays);
+    assert_eq!(options.probe_keys(), ["VICTORY_PROBE_RAYS"]);
+    assert!(enabled(&switches, options.probe_keys()));
+    set_enabled(&mut switches, options.probe_keys(), false);
+    assert!(switches.contains("VICTORY_PROBE_RAYS=0"));
+    assert!(!switches.contains("VICTORY_ACTIVATE_RAYS"));
 }

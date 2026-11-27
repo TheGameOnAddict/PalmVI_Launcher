@@ -31,10 +31,13 @@ pub(super) fn show(
     global_args: &str,
     global_switches: &str,
     project: &Project,
-) {
+    revision: Option<&str>,
+    can_rescan: bool,
+) -> Option<super::PlayPresetPicker> {
     let standalone = project.runs_standalone();
     let project_key = crate::project_key(&project.repo);
-    let id = ui.make_persistent_id("launch-preset-picker");
+    let id = ui.make_persistent_id(("launch-preset-picker", revision));
+    let mut review = None;
     let mut picker = ui
         .ctx()
         .data(|data| data.get_temp::<Picker>(id))
@@ -45,6 +48,9 @@ pub(super) fn show(
             ..Picker::default()
         });
     let compatible = |preset: &LaunchPreset| !standalone || preset.switches.is_none();
+    if let Some(detected) = &picker.detected {
+        restore_probe_control(presets, launch, &project_key, detected);
+    }
     if picker.last_applied != launch.selected_preset {
         picker.last_applied = launch.selected_preset.clone();
         picker.select(launch.selected_preset.clone());
@@ -268,6 +274,7 @@ pub(super) fn show(
                 if let Some(preset) = selected.cloned() {
                     let result = apply_to_profile(presets, launch, &project_key, preset);
                     if let Ok(name) = &result {
+                        launch.reviewed_script_revision = revision.map(str::to_owned);
                         picker.select(Some(name.clone()));
                         picker.last_applied = Some(name.clone());
                         ui.ctx().request_repaint();
@@ -279,13 +286,19 @@ pub(super) fn show(
         });
 
         ui.horizontal_wrapped(|ui| {
+            if !standalone && theme::small(ui, Look::Secondary, Some(theme::glyph::SYNC), "Rescan scripts", can_rescan)
+                .on_hover_text("Read the installed launch scripts again and choose one for this profile.").clicked() {
+                let scan = super::PlayPresetPicker::rescan(project, presets, launch);
+                picker.detected = scan.recommended_script();
+                review = Some(scan);
+            }
             if theme::small(ui, Look::Secondary, None, "Import file…", true)
                 .on_hover_text("Choose a preset JSON file or a PowerShell launch script.")
                 .clicked()
             {
                 let mut dialog =
                     rfd::FileDialog::new().add_filter("Preset or launch script", &["json", "ps1"]);
-                let scripts = crate::repo_dir(&project.repo).join("scripts");
+                let scripts = crate::project_script_root(project).join("scripts");
                 if scripts.is_dir() {
                     dialog = dialog.set_directory(scripts);
                 }
@@ -354,6 +367,7 @@ pub(super) fn show(
         show_status(ui, &picker.status);
     });
     ui.ctx().data_mut(|data| data.insert_temp(id, picker));
+    review
 }
 
 fn reset_to_global(ui: &mut Ui, value: &mut Option<String>) -> bool {
@@ -426,6 +440,23 @@ pub(super) fn apply_to_profile(
     } else {
         presets.iter().position(|saved| saved.name == preset.name)
     };
+    // A fresh scan supplies the current file, even when the library already has its name.
+    // Re-selecting the same script carries the player's changes onto the new defaults.
+    let mut keep_profile_edits = false;
+    if let Some(saved) = existing.map(|i| &mut presets[i]) {
+        if preset.repo_script.is_some() && preset.projects.is_empty() {
+            keep_profile_edits = launch.selected_preset.as_ref() == Some(&saved.name) && launch.switches.is_some();
+            if keep_profile_edits {
+                if let (Some(old), Some(new), Some(local)) = (&saved.switches, &preset.switches, &mut launch.switches) {
+                    if old != new { *local = script_preset::refresh_defaults(old, new, local); }
+                }
+                if launch.switches.is_some() { launch.script_options = preset.script_options; }
+            }
+            saved.switches = preset.switches.clone();
+            saved.args.clone_from(&preset.args);
+            saved.script_options = preset.script_options;
+        }
+    }
     let index = match existing {
         Some(index) => index,
         None => {
@@ -437,9 +468,10 @@ pub(super) fn apply_to_profile(
     if !saved.projects.iter().any(|key| key == project_key) {
         saved.projects.push(project_key.to_owned());
     }
-    saved.apply(launch);
+    if !keep_profile_edits { saved.apply(launch); }
     launch.selected_preset = Some(saved.name.clone());
     launch.preset_choice_confirmed = true;
+    launch.confirmed_repo_script = None;
     Ok(saved.name.clone())
 }
 
@@ -506,17 +538,18 @@ pub(super) fn show_script_options(
     switches: &mut String,
     options: script_preset::Options,
 ) {
-    use script_preset::{enabled, set_enabled, HOOKS, PROBE_RAYS, RAY_TRACING};
+    use script_preset::{enabled, set_enabled, HOOKS, RAY_TRACING};
+    let probe_keys = options.probe_keys();
     ui.horizontal_wrapped(|ui| {
         let mut ray_tracing = enabled(switches, RAY_TRACING);
         if options.ray_tracing && ui.checkbox(&mut ray_tracing, "Ray tracing").changed() {
             set_enabled(switches, RAY_TRACING, ray_tracing);
             if ray_tracing && options.probe_rays {
-                set_enabled(switches, PROBE_RAYS, false);
+                set_enabled(switches, probe_keys, false);
             }
         }
         if options.probe_rays {
-            let mut probe_rays = !ray_tracing && enabled(switches, PROBE_RAYS);
+            let mut probe_rays = !ray_tracing && enabled(switches, probe_keys);
             if ui
                 .add_enabled(
                     !ray_tracing,
@@ -525,7 +558,7 @@ pub(super) fn show_script_options(
                 .on_hover_text("Available with ray tracing off.")
                 .changed()
             {
-                set_enabled(switches, PROBE_RAYS, probe_rays);
+                set_enabled(switches, probe_keys, probe_rays);
             }
         }
         if options.hooks {
@@ -535,6 +568,39 @@ pub(super) fn show_script_options(
             }
         }
     });
+}
+
+// v0.2.3 imported newer Scarlett scripts without a Probe rays control.
+// Restore the control only for the matching repo preset and keep the user's launch values.
+fn restore_probe_control(
+    presets: &mut [LaunchPreset],
+    launch: &mut ProjectLaunch,
+    project_key: &str,
+    detected: &LaunchPreset,
+) {
+    if !detected
+        .script_options
+        .is_some_and(|options| options.probe_rays_single_switch)
+    {
+        return;
+    }
+    let Some(saved) = presets.iter_mut().find(|preset| {
+        preset.repo_script == detected.repo_script
+            && preset.projects.iter().any(|key| key == project_key)
+    }) else {
+        return;
+    };
+    for options in saved.script_options.iter_mut().chain(
+        launch
+            .script_options
+            .iter_mut()
+            .filter(|_| launch.selected_preset.as_deref() == Some(&saved.name)),
+    ) {
+        if !options.probe_rays {
+            options.probe_rays = true;
+            options.probe_rays_single_switch = true;
+        }
+    }
 }
 
 fn decode(json: &str) -> Result<LaunchPreset, String> {
@@ -643,4 +709,43 @@ fn accepting_a_detected_preset_saves_it_to_the_profile_without_duplicates() {
         .unwrap()
         .repo_script
         .is_none());
+}
+
+#[cfg(test)]
+#[test]
+fn restoring_probe_control_keeps_existing_profile_switches() {
+    let (switches, options) = script_preset::parse(
+        "$set = @{\nVICTORY_LOG = 'warn'\n}\n\
+if (-not $NoProbeRays -and -not $RayTracing) { $set.VICTORY_PROBE_RAYS = '1' }",
+    )
+    .unwrap();
+    let detected = LaunchPreset {
+        name: "play-scarlett".into(),
+        args: String::new(),
+        switches: Some(switches),
+        script_options: Some(options),
+        projects: vec!["owner/scarlett".into()],
+        repo_script: Some("play-scarlett".into()),
+    };
+    let old_switches = Some("VICTORY_LOG=info".to_owned());
+    let old_options = Some(script_preset::Options::default());
+    let mut saved = vec![LaunchPreset {
+        switches: old_switches.clone(),
+        script_options: old_options,
+        ..detected.clone()
+    }];
+    let mut launch = ProjectLaunch {
+        selected_preset: Some(detected.name.clone()),
+        script_options: old_options,
+        switches: old_switches.clone(),
+        ..ProjectLaunch::default()
+    };
+    restore_probe_control(&mut saved, &mut launch, "owner/scarlett", &detected);
+    assert_eq!(
+        launch.script_options.unwrap().probe_keys(),
+        ["VICTORY_PROBE_RAYS"]
+    );
+    assert!(launch.script_options.unwrap().probe_rays);
+    assert_eq!(launch.switches, old_switches);
+    assert_eq!(saved[0].switches, old_switches);
 }

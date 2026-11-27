@@ -38,7 +38,10 @@ keeps the files under `deleted-saves` in its install folder for recovery.
 - **Custom Git links:** add a Rust project with a Git clone URL from GitHub, GitLab, Codeberg, Gitea, or a self-hosted server.
 - **Rust workspaces:** Mandyhub builds the workspace and starts its program from **Play**. Library-only workspaces show **Built**.
 - **ZIP builds:** choose **Import Repo/Zip → Import build ZIP…** to import a prebuilt Windows executable and its bundled files. Mandyhub uses its normal game launch flow for `victory.exe`.
-- **Activity log:** expand the log, select its text with Ctrl+A, copy it, or export it to a file.
+- **Activity log:** use **Export log…** to share the launch report and full captured output. The report includes the executable, arguments, console settings, effective `VICTORY_*` switches, and shader and pipeline warm-up results.
+- **Scarlett launch presets** follow the installed script's defaults while preserving profile edits. Warm-up and Play use the same working directory, switches, cache and save folder. With warm-up enabled, Activity shows whether the shader pass ran, reused the cache, or encountered a problem. Pipeline warm-up has its own result in the exported log.
+- **Rescan scripts** in **Launch settings → Saved presets** to choose from the installed project's supported PowerShell launch scripts. After a project update, Mandyhub offers a fresh selection and remembers it for that revision. Re-selecting the same script preserves your profile edits.
+- **Project updates** pulse yellow on the project's **Check for updates** button. Selecting a project with an available update or finding one through a manual check opens **Overview**, where you can choose **Update now**.
 - **Install once, play many times:** a project is downloaded and built on your PC once and stays installed.
 - **Updates:** installed projects are checked for new versions at start and every 15 minutes; an update can be installed now or later.
 - **Install folder:** choose where projects are downloaded and built (a big drive is best); installed projects can be moved there.

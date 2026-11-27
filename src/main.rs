@@ -17,8 +17,11 @@ mod ui;
 mod saves;
 mod save_zip;
 mod build_activity;
+mod activity_log;
 mod updater;
 mod script_preset;
+#[cfg(all(test, windows))]
+mod launch_parity_tests;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -151,6 +154,7 @@ struct ProjectLaunch {
     script_options: Option<script_preset::Options>,
     selected_preset: Option<String>,
     preset_choice_confirmed: bool,
+    reviewed_script_revision: Option<String>,
     /// Records a custom script accepted by an earlier build.
     confirmed_repo_script: Option<String>,
     graphics: Option<GraphicsSettings>,
@@ -158,6 +162,10 @@ struct ProjectLaunch {
 }
 
 impl ProjectLaunch {
+    fn scripts_need_review(&self, installed: Option<&str>) -> bool {
+        matches!((self.reviewed_script_revision.as_deref(), installed), (Some(old), Some(new)) if old != new)
+    }
+
     fn has_confirmed_preset(&self) -> bool {
         self.preset_choice_confirmed || self.selected_preset.is_some() || self.confirmed_repo_script.is_some()
     }
@@ -212,6 +220,53 @@ impl OutputResolution {
 }
 
 impl Saved {
+    fn launch(&self, repo: &str, scarlett_shader_pass: bool) -> Launch {
+        let settings = self.project_launch.get(&project_key(repo));
+        let (args, extra) = self.launch_overrides(repo);
+        let graphics = self.graphics_for(repo);
+        Launch {
+            game_dir: std::path::absolute(&self.game_dir).unwrap_or_else(|_| PathBuf::from(&self.game_dir)),
+            series_s: graphics.series_s,
+            scale: graphics.render_scale,
+            output: graphics.output,
+            extra,
+            use_script_defaults: settings.is_some_and(|s| s.switches.is_some() && s.script_options.is_some()),
+            scarlett_shader_pass,
+            fullscreen: graphics.fullscreen,
+            warm_first: self.warm_before_play,
+            pipelines: self.warm_pipelines,
+            args,
+            program_args: settings.and_then(|s| s.args.as_deref()).map(split_args).unwrap_or_default(),
+        }
+    }
+
+    /// Follow the installed script when a profile uses a repository preset.
+    /// The stored preset is the baseline against which the player's edits were made.
+    fn refresh_repo_preset(&mut self, project: &Project) -> Result<Option<(String, bool)>, String> {
+        let key = project_key(&project.repo);
+        let Some(launch) = self.project_launch.get_mut(&key) else { return Ok(None) };
+        let Some(preset) = self.launch_presets.iter_mut().find(|p|
+            launch.selected_preset.as_ref() == Some(&p.name) && p.projects.contains(&key) && p.repo_script.is_some()
+        ) else { return Ok(None) };
+        let (Some(name), Some(profile), Some(previous)) =
+            (&preset.repo_script, &mut launch.switches, &mut preset.switches) else { return Ok(None) };
+        if !name.eq_ignore_ascii_case("play") && !name.to_ascii_lowercase().starts_with("play-")
+            || name.contains(['/', '\\', ':']) {
+            return Err("Invalid repository script name".into());
+        }
+        let path = project_script_root(project).join("scripts").join(format!("{name}.ps1"));
+        let source = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let (current, options) = script_preset::parse(&source)?;
+        if *previous != current {
+            *profile = script_preset::refresh_defaults(previous, &current, profile);
+            *previous = current;
+        }
+        launch.script_options = Some(options);
+        preset.script_options = Some(options);
+        let shader_pass = source.lines().any(|line| line.trim().eq_ignore_ascii_case("& $Victory shaders $rpf"));
+        Ok(Some((format!("{name}.ps1"), shader_pass)))
+    }
+
     fn default_graphics(&self) -> GraphicsSettings {
         GraphicsSettings {
             series_s: self.series_s,
@@ -285,10 +340,11 @@ struct Job {
     /// The project the job works on.
     repo: Option<String>,
     stage: String,
-    log: Vec<String>,
-    omitted_log_lines: usize,
+    warm_status: Option<String>,
+    log: activity_log::ActivityLog,
     imported_project: Option<Project>,
     removed_archive: Option<String>,
+    updated_project: Option<Project>,
     import_error: Option<String>,
     failed: bool,
     /// The process running now, while the player may stop it (a warm-up).
@@ -309,6 +365,7 @@ struct Launch {
     /// `VICTORY_*` lines: the player's switches and the graphics fixes.
     extra: String,
     use_script_defaults: bool,
+    scarlett_shader_pass: bool,
     fullscreen: bool,
     warm_first: bool,
     pipelines: bool,
@@ -429,7 +486,8 @@ const AUTO_CHECK_SECS: f64 = 15.0 * 60.0;
 /// A project's install on this PC and the newest version online.
 #[derive(Clone, Default)]
 struct RepoState {
-    checking: bool,
+    checking: Option<Arc<()>>,
+    feedback: Option<ProjectCheckFeedback>,
     /// Built and ready to play.
     installed: bool,
     /// The commit the installed build was made from.
@@ -437,6 +495,70 @@ struct RepoState {
     /// The newest commit online (`None` while unknown or unreachable).
     remote: Option<String>,
     activity: Option<build_activity::BuildActivity>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProjectCheckFeedback {
+    Available,
+    Current(std::time::Instant),
+    Failed(std::time::Instant),
+}
+
+impl RepoState {
+    fn finish_check(&mut self, ticket: &Arc<()>, mut next: Self, manual: bool) {
+        if !self.checking.as_ref().is_some_and(|active| Arc::ptr_eq(active, ticket)) {
+            return;
+        }
+        next.feedback = if manual {
+            let now = std::time::Instant::now();
+            match (&next.remote, &next.built) {
+                (None, _) => Some(ProjectCheckFeedback::Failed(now)),
+                (Some(remote), Some(built)) if remote == built => Some(ProjectCheckFeedback::Current(now)),
+                (Some(_), _) if next.installed => Some(ProjectCheckFeedback::Available),
+                _ => None,
+            }
+        } else if next.remote.is_some() && next.remote != self.remote {
+            None
+        } else {
+            self.feedback
+        };
+        if next.remote.is_none() {
+            next.remote = self.remote.take();
+        }
+        *self = next;
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn project_checks_distinguish_manual_results_and_ignore_replaced_requests() {
+    let result = |remote: Option<&str>| RepoState {
+        installed: true,
+        built: Some("built".into()),
+        remote: remote.map(str::to_owned),
+        ..RepoState::default()
+    };
+    let mut state = result(Some("built"));
+    let ticket = Arc::new(());
+    state.checking = Some(ticket.clone());
+    state.finish_check(&Arc::new(()), result(Some("obsolete")), true);
+    assert_eq!(state.remote.as_deref(), Some("built"));
+    assert!(state.checking.is_some());
+    state.finish_check(&ticket, result(Some("new")), false);
+    assert!(state.checking.is_none());
+    assert!(state.feedback.is_none());
+    let manual = |state: &mut RepoState, remote| {
+        let ticket = Arc::new(());
+        state.checking = Some(ticket.clone());
+        state.finish_check(&ticket, result(remote), true);
+    };
+    manual(&mut state, Some("new"));
+    assert_eq!(state.feedback, Some(ProjectCheckFeedback::Available));
+    manual(&mut state, None);
+    assert!(matches!(state.feedback, Some(ProjectCheckFeedback::Failed(_))));
+    assert_eq!(state.remote.as_deref(), Some("new"));
+    manual(&mut state, Some("built"));
+    assert!(matches!(state.feedback, Some(ProjectCheckFeedback::Current(_))));
 }
 
 /// What the background job does.
@@ -483,6 +605,14 @@ fn project_installed(repo: &str) -> bool {
 }
 fn repo_dir(repo: &str) -> PathBuf {
     workspace().join("repos").join(slug(repo))
+}
+fn project_script_root(p: &Project) -> PathBuf {
+    let dir = repo_dir(&p.repo);
+    if dir.join("scripts").is_dir() { return dir; }
+    if let Some(exe) = p.archive_program().or_else(|| p.local_exe.as_ref().map(PathBuf::from)) {
+        if let Some(parent) = exe.parent() { return parent.to_owned(); }
+    }
+    cargo_workspace(&dir).unwrap_or(dir)
 }
 fn target_dir(repo: &str) -> PathBuf {
     workspace().join("target").join(slug(repo))
@@ -561,28 +691,17 @@ fn detect_build_profile(repo_dir: &Path) -> &'static str {
 fn detect_launch_env(repo_dir: &Path) -> Vec<(String, String)> {
     let script = repo_dir.join("scripts").join("play.ps1");
     let Ok(text) = std::fs::read_to_string(&script) else { return Vec::new() };
-    let mut vars = Vec::new();
-    // Parse PowerShell hashtable lines like: VICTORY_FOO = '1'; VICTORY_BAR = '2'
-    // They appear inside $settings = @{ ... } and in conditional blocks.
-    for line in text.lines() {
-        let line = line.trim().trim_end_matches(';').trim();
-        // Match lines containing VICTORY_ assignments with single-quoted values.
-        for part in line.split(';') {
-            let part = part.trim();
-            if let Some((k, v)) = part.split_once('=') {
-                let k = k.trim().trim_start_matches("$settings.");
-                let v = v.trim().trim_matches('\'').trim_matches('"');
-                if k.starts_with("VICTORY_") && !k.contains(' ') {
-                    vars.push((k.to_string(), v.to_string()));
-                }
-            }
-        }
-    }
-    vars
+    script_preset::parse(&text).map(|(switches, _)| switches.lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_owned(), value.to_owned())).collect()).unwrap_or_default()
 }
 /// The commit an installed build was made from, written after a build.
 fn built_file(repo: &str) -> PathBuf {
     target_dir(repo).join("built-from.txt")
+}
+
+fn installed_revision(repo: &str) -> Option<String> {
+    std::fs::read_to_string(built_file(repo)).ok().map(|s| s.trim().to_owned()).filter(|s| !s.is_empty())
 }
 
 /// The newest commit of `p`'s branch online (`git ls-remote`, no download).
@@ -596,6 +715,7 @@ fn remote_head(p: &Project) -> Option<String> {
     };
     hide_window(&mut c);
     let out = c.output().ok()?;
+    if !out.status.success() { return None; }
     let text = String::from_utf8_lossy(&out.stdout);
     text.split_whitespace().next()
         .filter(|hash| matches!(hash.len(), 40 | 64) && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
@@ -614,11 +734,11 @@ fn repo_state(p: &Project) -> RepoState {
         return RepoState { installed: Path::new(exe).is_file(), built: Some("local".into()), ..RepoState::default() };
     }
     RepoState {
-        checking: false,
         installed: project_installed(&p.repo),
         built: std::fs::read_to_string(built_file(&p.repo)).ok().map(|s| s.trim().to_string()),
         remote: remote_head(p),
         activity: build_activity::BuildActivity::read(&target_dir(&p.repo)),
+        ..RepoState::default()
     }
 }
 
@@ -704,7 +824,7 @@ static INSTALL_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn set_install_dir(dir: &str) {
     let d = dir.trim();
-    *INSTALL_DIR.lock().unwrap() = (!d.is_empty()).then(|| PathBuf::from(d));
+    *INSTALL_DIR.lock().unwrap() = (!d.is_empty()).then(|| std::path::absolute(d).unwrap_or_else(|_| PathBuf::from(d)));
 }
 
 /// The parts of an install folder that belong to projects.
@@ -1063,19 +1183,23 @@ impl App {
     }
 
     /// Looks again at `p`'s install and the newest version online.
-    fn check_repo(&self, ctx: &egui::Context, p: &Project) {
+    fn check_repo(&self, ctx: &egui::Context, p: &Project, manual: bool) {
+        let ticket = Arc::new(());
         {
             let mut m = self.repos.lock().unwrap();
             let e = m.entry(p.repo.clone()).or_default();
-            if e.checking {
+            if e.checking.is_some() {
                 return;
             }
-            e.checking = true;
+            e.checking = Some(ticket.clone());
+            if manual { e.feedback = None; }
         }
         let (repos, ctx, p) = (self.repos.clone(), ctx.clone(), p.clone());
         std::thread::spawn(move || {
             let st = repo_state(&p);
-            repos.lock().unwrap().insert(p.repo.clone(), st);
+            if let Some(state) = repos.lock().unwrap().get_mut(&p.repo) {
+                state.finish_check(&ticket, st, manual);
+            }
             ctx.request_repaint();
         });
     }
@@ -1119,42 +1243,69 @@ impl App {
         }
         // An install over an installed project is an update.
         let updating = kind == Kind::Install && project_installed(&p.repo);
+        // Anchor legacy choices to the currently installed commit before a build can replace it.
+        if updating && !p.runs_standalone() {
+            if let Some(revision) = installed_revision(&p.repo) {
+                self.saved.project_launch.entry(project_key(&p.repo)).or_default()
+                    .reviewed_script_revision.get_or_insert(revision);
+            }
+        }
         if kind == Kind::Install || kind == Kind::Warm {
             self.show_log = true;
         }
         self.log_export_status = None;
+        let script = if matches!(kind, Kind::Play(_) | Kind::Warm) {
+            self.saved.refresh_repo_preset(&p)
+        } else { Ok(None) };
         let settings = self.saved.project_launch.get(&project_key(&p.repo));
-        let (args, extra) = self.saved.launch_overrides(&p.repo);
-        let graphics = self.saved.graphics_for(&p.repo);
-        let launch = Launch {
-            game_dir: PathBuf::from(&self.saved.game_dir),
-            series_s: graphics.series_s,
-            scale: graphics.render_scale,
-            output: graphics.output,
-            extra,
-            use_script_defaults: settings.is_some_and(|settings| settings.switches.is_some() && settings.script_options.is_some()),
-            fullscreen: graphics.fullscreen,
-            warm_first: self.saved.warm_before_play,
-            pipelines: self.saved.warm_pipelines,
-            args,
-            program_args: settings.and_then(|settings| settings.args.as_deref()).map(split_args).unwrap_or_default(),
-        };
+        let launch = self.saved.launch(&p.repo, matches!(&script, Ok(Some((_, true)))));
+        if matches!(kind, Kind::Play(_) | Kind::Warm) {
+            let mut job = job.lock().unwrap();
+            job.log.report(concat!("Mandyhub version: ", env!("CARGO_PKG_VERSION")));
+            job.log.report(format!("Project: {} ({})", p.name, p.repo));
+            match script {
+                Ok(Some((name, _))) => job.log.report(format!("Loaded current repository preset: {name} (profile edits retained).")),
+                Err(error) => job.log.report(format!("Using saved launch switches. Could not refresh repository preset: {error}")),
+                Ok(None) => {}
+            }
+            if let Ok(revision) = std::fs::read_to_string(built_file(&p.repo)) {
+                job.log.report(format!("Installed revision: {}", revision.trim()));
+            }
+            if let Some(preset) = settings.and_then(|settings| settings.selected_preset.as_deref()) {
+                job.log.report(format!("Selected launch preset: {preset}"));
+            }
+        }
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
             let r = match &kind {
                 Kind::Install => install(&job, &ctx, &p, updating),
                 Kind::Play(choice) => play(&job, &ctx, &p, &launch, choice),
                 Kind::Uninstall => uninstall(&job, &ctx, &p),
-                Kind::Warm => warm(&job, &ctx, &p, &launch),
+                Kind::Warm => project_exe(&p).and_then(|exe| {
+                    let mut command = Command::new(exe);
+                    victory_env(&mut command, &p, &launch);
+                    warm(&job, &ctx, &command, &launch)
+                }),
             };
             {
                 let mut j = job.lock().unwrap();
                 j.running = false;
                 j.pid = None;
                 j.stoppable = false;
+                if matches!(kind, Kind::Play(_) | Kind::Warm) {
+                    let result = match &r {
+                        _ if j.stopped => "Stopped by user".to_owned(),
+                        Ok(()) => "Completed successfully".to_owned(),
+                        Err(error) => format!("Failed: {error}"),
+                    };
+                    j.log.report(format!("\nJob result: {result}"));
+                }
                 match r {
                     _ if j.stopped => j.stage = "Stopped".into(),
                     Ok(()) => {
+                        if kind == Kind::Install && updating {
+                            j.updated_project = Some(p.clone());
+                        }
                         if kind == Kind::Uninstall && p.archive_exe.is_some() {
                             j.removed_archive = Some(p.repo.clone());
                         }
@@ -1254,6 +1405,16 @@ fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &
     cargo.current_dir(&workspace);
     if victory {
         cargo.args(["-p", "victory"]);
+        // Scarlett's diag profile and Cargo's diagnostics feature are separate switches.
+        if profile == "diag"
+            && metadata["packages"].as_array().is_some_and(|packages| packages.iter().any(|pkg|
+                pkg["name"] == "victory" && pkg["features"].get("diagnostics").is_some()))
+            && std::fs::read_to_string(workspace.join("scripts/play-scarlett.ps1")).is_ok_and(|script|
+                script.contains("cargo build --profile diag -p victory --features diagnostics"))
+        {
+            cargo.args(["--features", "diagnostics"]);
+            job.lock().unwrap().log.push("Building with the Scarlett launcher's diagnostics feature.".into());
+        }
         run(job, ctx, &mut cargo)?;
         let executable = target.join(profile).join("victory.exe");
         if !executable.is_file() {
@@ -1320,6 +1481,7 @@ fn project_exe(p: &Project) -> Result<PathBuf, String> {
 /// Play: the project's own env vars (from its scripts/play.ps1) first, then
 /// the mode, its data and cache folders, and the player's switches.
 fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
+    let root = project_script_root(p);
     if let Some(program) = p.archive_program() {
         if let Some(directory) = program.parent() {
             c.current_dir(directory);
@@ -1329,12 +1491,21 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
                 }
             }
         }
-        c.env("VICTORY_GAME_DIR", &l.game_dir);
-    } else if l.use_script_defaults {
-        c.env("VICTORY_GAME_DIR", &l.game_dir);
+    } else if p.is_git() && root.is_dir() {
+        c.current_dir(&root);
+    } else if let Some(parent) = p.local_exe.as_deref().and_then(|exe| Path::new(exe).parent()).filter(|p| p.is_dir()) {
+        c.current_dir(parent);
     }
+    if l.scarlett_shader_pass {
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().to_ascii_uppercase().starts_with("VICTORY_") {
+                c.env_remove(key);
+            }
+        }
+    }
+    c.env("VICTORY_GAME_DIR", &l.game_dir);
     if !l.use_script_defaults {
-        for (k, v) in detect_launch_env(&repo_dir(&p.repo)) {
+        for (k, v) in detect_launch_env(&root) {
             c.env(&k, &v);
         }
     }
@@ -1347,7 +1518,6 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
     }
     let ws = workspace();
     let data = ws.join("data").join(slug(&p.repo));
-    let _ = std::fs::create_dir_all(&data);
     c.env("VICTORY_DATA_DIR", &data);
     c.env("VICTORY_CACHE_DIR", ws.join("cache").join(slug(&p.repo)));
     for line in l.extra.lines() {
@@ -1360,8 +1530,17 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
     }
 }
 
-fn victory_help(exe: &Path, subcommand: &str) -> Option<String> {
-    let mut command = Command::new(exe);
+fn child_command(base: &Command) -> Command {
+    let mut command = Command::new(base.get_program());
+    if let Some(dir) = base.get_current_dir() { command.current_dir(dir); }
+    for (key, value) in base.get_envs() {
+        if let Some(value) = value { command.env(key, value); } else { command.env_remove(key); }
+    }
+    command
+}
+
+fn victory_help(base: &Command, subcommand: &str) -> Option<String> {
+    let mut command = child_command(base);
     command.args([subcommand, "--help"]);
     hide_window(&mut command);
     let output = command.output().ok()?;
@@ -1370,15 +1549,44 @@ fn victory_help(exe: &Path, subcommand: &str) -> Option<String> {
 
 /// Some forks open their pipeline bookkeeping files even before the first game run.
 fn prepare_pipeline_cache(command: &Command) -> Result<(), String> {
-    let Some(cache) = command.get_envs().find_map(|(key, value)| {
-        (key == "VICTORY_CACHE_DIR").then_some(value).flatten().filter(|path| !path.is_empty())
-    }) else {
+    let Some(cache) = launch_folder(command, "VICTORY_CACHE_DIR") else {
         return Ok(());
     };
-    let cache = Path::new(cache);
-    let folder = command.get_current_dir().unwrap_or(Path::new(".")).join(cache).join("pipelines");
+    let folder = cache.join("pipelines");
     std::fs::create_dir_all(&folder)
         .map_err(|error| format!("Could not create the pipeline cache folder {}: {error}", folder.display()))
+}
+
+fn launch_folder(command: &Command, key: &str) -> Option<PathBuf> {
+    let value = command.get_envs().find(|(name, _)| *name == key)?.1?;
+    if value.is_empty() { return None; }
+    Some(command.get_current_dir().unwrap_or(Path::new(".")).join(value))
+}
+
+fn prepare_launch_folders(command: &Command) -> Result<(), String> {
+    for key in ["VICTORY_DATA_DIR", "VICTORY_CACHE_DIR"] {
+        if let Some(folder) = launch_folder(command, key) {
+            std::fs::create_dir_all(&folder).map_err(|e| format!("Could not create {key} at {}: {e}", folder.display()))?;
+        }
+    }
+    Ok(())
+}
+
+/// Reuse Scarlett's pretranslation only when the executable, archive and effective
+/// translation settings still match and the shader cache still contains files.
+fn shader_stamp(base: &Command, archive: &Path) -> Option<(PathBuf, String)> {
+    let cache = launch_folder(base, "VICTORY_CACHE_DIR")?;
+    let mut inputs = Vec::new();
+    for path in [Path::new(base.get_program()), archive] {
+        let info = path.metadata().ok()?;
+        inputs.push(format!("{path:?} {:?} {}", info.modified().ok()?, info.len()));
+    }
+    for (key, value) in base.get_envs() {
+        if key != "VICTORY_DATA_DIR" {
+            inputs.push(format!("{key:?}={value:?}"));
+        }
+    }
+    Some((cache.join("mandyhub-shaders-ahead.txt"), inputs.join("\n")))
 }
 
 #[cfg(test)]
@@ -1396,54 +1604,102 @@ fn pipeline_warm_up_creates_the_configured_cache_on_first_use() {
 }
 
 /// Fills the same shader cache as Play, using the commands the installed fork exposes.
-fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> Result<(), String> {
-    let exe = project_exe(p)?;
+fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, base: &Command, l: &Launch) -> Result<(), String> {
+    stage(job, ctx, "Warming up shaders (checking build support)");
+    prepare_launch_folders(base)?;
     let files: Vec<PathBuf> = WARM_FILES.iter().map(|f| l.game_dir.join(f)).filter(|f| f.is_file()).collect();
     if files.is_empty() {
         return Err("the game files were not found: choose their folder in Settings".into());
     }
-    let translate = victory_help(&exe, "translate");
+    let translate = if l.scarlett_shader_pass { None } else { victory_help(base, "translate") };
     let supports_flag = |help: &str, flag: &str| help.split_whitespace().any(|word| word == flag);
     let translate_cache = translate.as_deref().filter(|help| supports_flag(help, "--cache"));
     let mut commands = Vec::new();
-    let mut shaders = Command::new(&exe);
-    if let Some(help) = translate_cache {
+    let mut shaders = child_command(base);
+    let mut stamp = None;
+    if l.scarlett_shader_pass {
+        let rpf = l.game_dir.join("shaders.rpf");
+        if !rpf.is_file() { return Err(format!("Shader archive missing: {}", rpf.display())); }
+        stamp = shader_stamp(base, &rpf);
+        shaders.arg("shaders").arg(rpf);
+    } else if let Some(help) = translate_cache {
         shaders.args(["translate", "--cache"]);
         if l.pipelines && supports_flag(help, "--pipelines") {
             shaders.arg("--pipelines");
         }
-    } else if victory_help(&exe, "shaders").is_some() {
-        shaders.arg("shaders");
+        shaders.args(&files);
+    } else if victory_help(base, "shaders").is_some() {
+        shaders.arg("shaders").args(&files);
     } else {
         return Err("This build offers neither translate --cache nor shaders for shader warm-up.".into());
     }
-    shaders.args(&files);
-    commands.push(shaders);
-    if l.pipelines && !translate_cache.is_some_and(|help| supports_flag(help, "--pipelines")) {
-        if victory_help(&exe, "warm").is_some_and(|help| supports_flag(&help, "--used")) {
-            let mut pipelines = Command::new(&exe);
-            pipelines.args(["warm", "--used"]);
+    let combined_pipelines = shaders.get_args().any(|arg| arg == "--pipelines");
+    let cached = stamp.as_ref().and_then(|(path, expected)| {
+        let old = std::fs::read_to_string(path).ok()?;
+        let (inputs, summary) = old.rsplit_once("\n\n")?;
+        (inputs == expected && path.with_file_name("shaders").read_dir().is_ok_and(|mut entries| entries.next().is_some_and(|entry| entry.is_ok())))
+            .then(|| summary.to_owned())
+    });
+    let mut status = if let Some(summary) = cached {
+        job.lock().unwrap().log.report(format!("Shader warm-up: cache current for this build and settings. Previous pass: {summary}"));
+        format!("Shader cache current · {summary}")
+    } else {
+        commands.push(shaders);
+        "Shader warm-up completed".to_owned()
+    };
+    if l.pipelines && !combined_pipelines {
+        if let Some(help) = victory_help(base, "warm") {
+            let mut pipelines = child_command(base);
+            pipelines.arg("warm");
+            if supports_flag(&help, "--used") { pipelines.arg("--used"); }
             commands.push(pipelines);
         } else {
-            job.lock().unwrap().log.push("This build does not expose a supported pipeline warm-up. Warming shaders only.".into());
+            status.push_str(" · pipeline warm-up unavailable");
+            job.lock().unwrap().log.report("Pipeline warm-up skipped: the build has no supported pipeline command.");
         }
     }
-    stage(
-        job,
-        ctx,
-        if l.pipelines {
-            "Warming up shaders and pipelines (this can take hours)"
-        } else {
-            "Warming up shaders (the first time takes minutes)"
-        },
-    );
+    if !l.pipelines {
+        job.lock().unwrap().log.report("Pipeline warm-up skipped: disabled in Settings.");
+    }
+    let warming_pipelines = combined_pipelines || commands.iter().any(|cmd| cmd.get_args().next().is_some_and(|arg| arg == "warm"));
+    let mut pipeline_status = "pipeline warm-up completed".to_owned();
     for mut command in commands {
-        victory_env(&mut command, p, l);
-        if command.get_args().next().is_some_and(|arg| arg == "warm") {
-            prepare_pipeline_cache(&command)?;
-        }
-        job.lock().unwrap().stoppable = true;
-        let result = run_with(job, ctx, &mut command, |pid| job.lock().unwrap().pid = Some(pid));
+        let separate_pipelines = command.get_args().next().is_some_and(|arg| arg == "warm");
+        let label = if separate_pipelines {
+            "Pipeline warm-up"
+        } else if command.get_args().any(|arg| arg == "--pipelines") {
+            "Shader and pipeline warm-up"
+        } else {
+            "Shader warm-up"
+        };
+        stage(job, ctx, match label {
+            "Pipeline warm-up" => "Warming up pipelines",
+            "Shader and pipeline warm-up" => "Warming up shaders and pipelines",
+            _ => "Warming up shaders",
+        });
+        job.lock().unwrap().log.command(label, &command, true);
+        prepare_pipeline_cache(&command)?;
+        let shader_totals = Arc::new(Mutex::new(None));
+        let captured = shader_totals.clone();
+        let pipeline_summary = Arc::new(Mutex::new(None));
+        let pipeline_output = pipeline_summary.clone();
+        let result = run_with_output(job, ctx, &mut command, |pid| {
+            let mut j = job.lock().unwrap();
+            j.pid = Some(pid);
+            j.stoppable = true;
+        }, move |line| {
+            if separate_pipelines && line.contains(" pipelines known, ") && line.contains(" to make, ") {
+                *pipeline_output.lock().unwrap() = Some(line.clone());
+            }
+            if let Some((count, rest)) = line.split_once(" shaders in the cache, ") {
+                if let Some((failed, _)) = rest.split_once(" do not translate,") {
+                    if let (Ok(count), Ok(failed)) = (count.trim().parse::<usize>(), failed.parse::<usize>()) {
+                        *captured.lock().unwrap() = Some((count, failed));
+                    }
+                }
+            }
+            Some(line)
+        });
         let stopped = {
             let mut j = job.lock().unwrap();
             j.stoppable = false;
@@ -1451,14 +1707,56 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch) -> 
             j.stopped
         };
         if stopped {
+            job.lock().unwrap().log.report(format!("{label} result: stopped by user."));
             return Err("stopped".into());
         }
+        job.lock().unwrap().log.report(match &result {
+            Ok(()) => format!("{label} result: completed successfully."),
+            Err(error) => format!("{label} result: failed ({error})."),
+        });
         result?;
+        if let Some(summary) = pipeline_summary.lock().unwrap().as_deref() {
+            job.lock().unwrap().log.report(format!("Pipeline inventory: {summary}"));
+            if summary.starts_with("0 pipelines known,") {
+                pipeline_status = "no recorded pipelines to warm".into();
+            } else if summary.contains("; 0 to make,") {
+                pipeline_status = "no pending pipelines".into();
+            }
+        }
+        if let Some((count, failed)) = *shader_totals.lock().unwrap() {
+            job.lock().unwrap().log.report(format!("Shader totals: {count} cached, {failed} could not translate."));
+            if count == 0 { return Err("The shader command completed with zero shaders cached".into()); }
+            if failed > 0 {
+                status = format!("{count} shaders cached · {failed} could not translate");
+            }
+        }
+        if !separate_pipelines {
+            if let Some((path, value)) = &stamp {
+                if let Err(e) = std::fs::write(path, format!("{value}\n\n{status}")) {
+                    job.lock().unwrap().log.report(format!("Could not remember shader warm-up: {e}"));
+                }
+            }
+        }
     }
+    if warming_pipelines { status.push_str(&format!(" · {pipeline_status}")); }
+    job.lock().unwrap().warm_status = Some(status);
     Ok(())
 }
 
 /// Starts the installed build of `p`, warming its shaders first when the player asked for that.
+fn game_command(exe: &Path, p: &Project, l: &Launch) -> Command {
+    let mut c = Command::new(exe);
+    c.arg("run").arg(l.game_dir.join(EXE_NAME)).arg("--execute");
+    let explicit_console = l.args.iter().take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--console" || arg.starts_with("--console="));
+    if !explicit_console && (l.series_s || l.output != OutputResolution::Default) {
+        c.args(["--console", if l.series_s { "series-s" } else { "series-x" }]);
+    }
+    c.args(&l.args);
+    victory_env(&mut c, p, l);
+    c
+}
+
 fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, choice: &saves::LaunchSave) -> Result<(), String> {
     if p.runs_standalone() {
         let (exe, dir) = if let Some(exe) = p.archive_program() {
@@ -1471,6 +1769,10 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
         };
         let mut command = Command::new(exe);
         command.current_dir(dir).args(&l.program_args);
+        let mut j = job.lock().unwrap();
+        j.log.report("VIctory shader warm-up skipped: this profile launches a standalone program.");
+        j.log.command("Program launch", &command, false);
+        drop(j);
         stage(job, ctx, "Playing");
         return run_with(job, ctx, &mut command, |_| {
             if let Err(error) = build_activity::BuildActivity::record_run(&target_dir(&p.repo)) {
@@ -1479,29 +1781,54 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
         });
     }
     let exe = project_exe(p)?;
-    if l.warm_first {
-        if let Err(e) = warm(job, ctx, p, l) {
-            if job.lock().unwrap().stopped {
-                return Err("stopped".into());
-            }
-            job.lock().unwrap().log.push(format!("Warm-up failed: {e}. Starting the game anyway."));
-        }
-    }
-    stage(job, ctx, "Playing");
-    let mut c = Command::new(&exe);
-    c.arg("run").arg(l.game_dir.join(EXE_NAME)).arg("--execute");
-    let explicit_console = l.args.iter().take_while(|arg| arg.as_str() != "--")
-        .any(|arg| arg == "--console" || arg.starts_with("--console="));
-    if !explicit_console && (l.series_s || l.output != OutputResolution::Default) {
-        c.args(["--console", if l.series_s { "series-s" } else { "series-x" }]);
-    }
-    // The player's own: more `run` flags, and after `--` the game's.
-    c.args(&l.args);
-    victory_env(&mut c, p, l);
+    job.lock().unwrap().log.report(format!(
+        "Warm-up before Play: {}. Pipeline warm-up requested: {}.",
+        if l.warm_first { "on" } else { "off" },
+        if l.warm_first && l.pipelines { "yes" } else { "no" },
+    ));
+    let mut c = game_command(&exe, p, l);
     let project_data = workspace().join("data").join(slug(&p.repo));
     let data = saves::prepare(&project_data, choice).map_err(|error| format!("Could not prepare saves: {error}"))?;
     if data != project_data {
         c.env("VICTORY_DATA_DIR", data);
+    }
+    prepare_launch_folders(&c)?;
+    if l.warm_first {
+        if let Err(e) = warm(job, ctx, &c, l) {
+            let mut job = job.lock().unwrap();
+            if job.stopped { return Err("stopped".into()); }
+            job.warm_status = Some("Warm-up failed · see log".into());
+            job.log.report(format!("Warm-up failed: {e}. Continued to game launch."));
+            job.log.push(format!("Warm-up failed: {e}. Starting the game anyway."));
+        }
+    } else {
+        job.lock().unwrap().warm_status = Some("Warm-up off in Settings".into());
+    }
+    stage(job, ctx, "Playing");
+    {
+        let mut job = job.lock().unwrap();
+        job.log.command("Game launch", &c, true);
+        let args: Vec<_> = c.get_args().take_while(|arg| *arg != "--").collect();
+        let console = args.iter().enumerate().find_map(|(index, arg)| {
+            let arg = arg.to_str()?;
+            arg.strip_prefix("--console=").or_else(|| {
+                (arg == "--console").then(|| args.get(index + 1).and_then(|mode| mode.to_str()).unwrap_or("(missing value)"))
+            })
+        });
+        job.log.report(format!("Configured graphics profile: {}", if l.series_s { "Series S" } else { "Series X" }));
+        job.log.report(format!("Console passed to VIctory: {}", console.unwrap_or("build default (no --console argument)")));
+        job.log.report(format!("Configured render scale: {:.0}%", l.scale * 100.0));
+        job.log.report(format!("Configured output resolution: {}", l.output.label()));
+        job.log.report(format!("Borderless fullscreen: {}", if l.fullscreen { "on" } else { "off" }));
+        let save_choice = match choice {
+            saves::LaunchSave::Continue => "Continue",
+            saves::LaunchSave::Fresh => "Start fresh",
+            saves::LaunchSave::Copy(_) => "Copy existing save or checkpoint",
+        };
+        job.log.report(format!("Save choice: {save_choice}"));
+        if let saves::LaunchSave::Copy(source) = choice {
+            job.log.report(format!("Save source: {source:?}"));
+        }
     }
     let fullscreen = l.fullscreen;
     run_with(job, ctx, &mut c, |pid| {
@@ -1548,10 +1875,6 @@ fn run_with_output(
                 let Some(line) = (if filter_stdout { filter(line) } else { Some(line) }) else { continue };
                 let mut j = job.lock().unwrap();
                 j.log.push(line);
-                if j.log.len() > 4000 {
-                    j.log.drain(..1000);
-                    j.omitted_log_lines += 1000;
-                }
                 drop(j);
                 ctx.request_repaint();
             }
@@ -1573,10 +1896,19 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.updater.poll();
-        let (imported, removed) = {
+        let (imported, removed, updated) = {
             let mut job = self.job.lock().unwrap();
-            (job.imported_project.take(), job.removed_archive.take())
+            (job.imported_project.take(), job.removed_archive.take(), job.updated_project.take())
         };
+        if let Some(project) = updated {
+            if self.view == View::Projects && self.saved.selected.as_ref() == Some(&project.repo)
+                && self.screenshot_projects.is_none() && self.add_repo.is_none() && self.confirm_uninstall.is_none()
+                && self.pending_move.is_none() && self.play_preset_picker.is_none() && self.save_picker.is_none()
+            {
+                let launch = self.saved.project_launch.get(&project_key(&project.repo));
+                self.play_preset_picker = ui::PlayPresetPicker::after_project_update(&project, &self.saved.launch_presets, launch);
+            }
+        }
         if let Some(project) = imported {
             self.saved.selected = Some(project.repo.clone());
             self.saved.custom.insert(0, project);
@@ -1743,7 +2075,7 @@ impl App {
         self.last_auto_check = now;
         for p in self.all_projects() {
             if p.is_git() && project_installed(&p.repo) {
-                self.check_repo(ctx, &p);
+                self.check_repo(ctx, &p, false);
             }
         }
     }

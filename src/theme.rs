@@ -383,6 +383,8 @@ pub enum Look {
     Primary,
     Secondary,
     Ghost,
+    /// A ghost button with a pulsing status colour.
+    Signal(Color32, f32),
     /// A navy pill, for the sunset strip.
     Night,
     /// A destructive action offered next to others.
@@ -410,6 +412,11 @@ fn colors(look: Look, t: f32, live: bool) -> (Color32, Stroke, Color32) {
         Look::Primary => (mix(PINK, PINK_HI, t), Stroke::NONE, PLUM),
         Look::Secondary => (mix(RAISED, RAISED_HI, t), Stroke::new(1.0, mix(LINE_STRONG, PINK, 0.5 * t)), WHITE),
         Look::Ghost => (mix(Color32::TRANSPARENT, RAISED, t), Stroke::NONE, mix(LILAC, WHITE, t)),
+        Look::Signal(color, strength) => (
+            mix(mix(Color32::TRANSPARENT, RAISED, t), color, 0.2 * strength),
+            Stroke::new(1.0_f32, color.gamma_multiply(0.8 * strength)),
+            mix(mix(LILAC, WHITE, t), color, strength),
+        ),
         Look::Night => (mix(BG, NIGHT_HI, t), Stroke::NONE, WHITE),
         Look::Danger => (mix(Color32::TRANSPARENT, BAD.gamma_multiply(0.14), t), Stroke::NONE, BAD),
         Look::DangerSolid => (mix(BAD, WHITE, 0.15 * t), Stroke::NONE, ON_BAD),

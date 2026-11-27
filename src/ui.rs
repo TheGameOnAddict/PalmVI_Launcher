@@ -5,7 +5,7 @@
 
 use crate::theme::{self, glyph, Look, Size, Stat};
 use crate::{default_workspace, parse_git_repo, project_installed, project_key, rust_install, search_drives, slides, tools, workspace};
-use crate::{AddRepo, App, GraphicsSettings, Kind, OutputResolution, Project, RepoState, View};
+use crate::{AddRepo, App, GraphicsSettings, Kind, OutputResolution, Project, ProjectCheckFeedback, View};
 use eframe::egui::{self, vec2, Align, Color32, Frame, Label, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::time::Duration;
 
@@ -23,6 +23,52 @@ const MODES: [(&str, bool, f32, &str); 3] = [
 ];
 const PROJECT_GRAPHICS_WIDTH: f32 = 310.0;
 const GRAPHICS_BAND_HEIGHT: f32 = 40.0;
+
+fn profile_tab_key(repo: &str) -> String {
+    format!("project-profile-tab:{repo}")
+}
+
+fn project_check_button(ctx: &egui::Context, feedback: Option<ProjectCheckFeedback>, available: bool, now: f64) -> (&'static str, Look) {
+    let message = match feedback {
+        Some(ProjectCheckFeedback::Current(at)) => Some(("No new update found", at)),
+        Some(ProjectCheckFeedback::Failed(at)) => Some(("Update check failed", at)),
+        _ => None,
+    };
+    if let Some((label, at)) = message {
+        let age = at.elapsed().as_secs_f32();
+        if age < 3.0 {
+            let pulse = 0.75 + 0.25 * (age * std::f32::consts::TAU).cos();
+            let fade = (3.0 - age).min(1.0);
+            ctx.request_repaint_after(Duration::from_millis(40));
+            return (label, Look::Signal(theme::BAD, pulse * fade));
+        }
+    }
+    let look = if available {
+        ctx.request_repaint_after(Duration::from_millis(40));
+        Look::Signal(Color32::from_rgb(255, 219, 95), 0.7 + 0.3 * (now as f32 * 3.0).cos())
+    } else {
+        Look::Ghost
+    };
+    ("Check for updates", look)
+}
+
+#[cfg(test)]
+#[test]
+fn project_check_button_fades_back_after_a_manual_result() {
+    let ctx = egui::Context::default();
+    let (label, look) = project_check_button(&ctx, None, true, 0.0);
+    assert_eq!(label, "Check for updates");
+    assert!(matches!(look, Look::Signal(color, _) if color != theme::BAD));
+    let current = std::time::Instant::now();
+    let (label, look) = project_check_button(&ctx, Some(ProjectCheckFeedback::Current(current)), false, 0.0);
+    assert_eq!(label, "No new update found");
+    assert!(matches!(look, Look::Signal(color, _) if color == theme::BAD));
+    let past = current - Duration::from_secs(4);
+    let (label, look) = project_check_button(&ctx, Some(ProjectCheckFeedback::Current(past)), false, 4.0);
+    assert_eq!(label, "Check for updates");
+    assert!(look == Look::Ghost);
+    assert_eq!(project_check_button(&ctx, Some(ProjectCheckFeedback::Failed(current)), false, 0.0).0, "Update check failed");
+}
 
 fn note(ui: &mut Ui, text: &str) {
     ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::FAINT));
@@ -473,9 +519,25 @@ impl App {
 
     /// The selected project's page.
     fn page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let Some(p) = self.selected_project() else { return self.empty_page(ui) };
+        let Some(p) = self.selected_project() else {
+            self.shown = None;
+            return self.empty_page(ui);
+        };
         let now = ctx.input(|i| i.time);
-        if self.shown.as_deref() != Some(p.repo.as_str()) {
+        let just_selected = self.shown.as_deref() != Some(p.repo.as_str());
+        let found_on_request = self.repos.lock().unwrap().get_mut(&p.repo).is_some_and(|state| {
+            if state.feedback != Some(ProjectCheckFeedback::Available) { return false; }
+            state.feedback = None;
+            true
+        });
+        if found_on_request {
+            // An explicit check makes a previously deferred update actionable again.
+            self.saved.later.retain(|(repo, _)| repo != &p.repo);
+        }
+        if (just_selected || found_on_request) && self.update_for(&p).is_some() {
+            ctx.data_mut(|data| data.insert_temp(egui::Id::new(profile_tab_key(&p.repo)), 0_usize));
+        }
+        if just_selected {
             self.shown = Some(p.repo.clone());
             self.shown_at = now;
         }
@@ -573,12 +635,12 @@ impl App {
         let st = match self.state_of(&p.repo) {
             Some(st) => st,
             None => {
-                self.check_repo(ctx, p);
-                RepoState { checking: true, ..Default::default() }
+                self.check_repo(ctx, p, false);
+                self.state_of(&p.repo).unwrap_or_default()
             }
         };
         // While the first look runs, what is on disk already says installed or not.
-        let installed = st.installed || (st.checking && (
+        let installed = st.installed || (st.checking.is_some() && (
             p.archive_program().is_some_and(|exe| exe.is_file())
             || (p.is_git() && project_installed(&p.repo))
         ));
@@ -708,8 +770,8 @@ impl App {
 
         if installed {
             ui.add_space(14.0);
-            ui.horizontal(|ui| {
-                if st.checking {
+            ui.horizontal_wrapped(|ui| {
+                if st.checking.is_some() {
                     ui.add(egui::Spinner::new().size(12.0).color(theme::FAINT));
                     note(ui, "Checking for updates");
                 } else {
@@ -720,8 +782,11 @@ impl App {
                 }
                 if p.local_exe.is_none() {
                     ui.add_space(6.0);
-                    if p.is_git() && theme::small(ui, Look::Ghost, Some(glyph::SYNC), "Check for updates", !st.checking).clicked() {
-                        self.check_repo(ctx, p);
+                    if p.is_git() {
+                        let (label, look) = project_check_button(ctx, st.feedback, self.update_for(p).is_some(), now);
+                        if theme::small(ui, look, Some(glyph::SYNC), label, st.checking.is_none() && !this_job).clicked() {
+                            self.check_repo(ctx, p, true);
+                        }
                     }
                     if victory && theme::small(ui, Look::Ghost, Some(glyph::WARM), "Warm up shaders", !running && self.files_ok())
                         .on_hover_text("Translate the game's shaders into this project's cache now, so it does not stop to translate them while you play.").clicked() {
@@ -835,7 +900,7 @@ impl App {
 
     fn profile_tabs(&mut self, ui: &mut Ui, ctx: &egui::Context, project: &Project) {
         ui.add_space(20.0);
-        let tab_key = format!("project-profile-tab:{}", project.repo);
+        let tab_key = profile_tab_key(&project.repo);
         let id = egui::Id::new(&tab_key);
         let mut tab = ctx.data(|data| data.get_temp::<usize>(id)).unwrap_or_default();
         if let Some(selected) = theme::segmented(ui, &tab_key, &["Overview", "Profile notes", "Launch settings"], Some(tab), None) {
@@ -857,7 +922,7 @@ impl App {
         let key = project_key(&project.repo);
         if self.saved.project_launch.get(&key).is_some_and(|launch| {
             launch.args.is_none() && launch.switches.is_none() && launch.graphics.is_none()
-                && launch.notes.is_empty() && !launch.has_confirmed_preset()
+                && launch.notes.is_empty() && !launch.has_confirmed_preset() && launch.reviewed_script_revision.is_none()
         }) {
             self.saved.project_launch.remove(&key);
         }
@@ -924,13 +989,17 @@ impl App {
     }
 
     fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {
+        let revision = self.state_of(&project.repo).and_then(|s| s.built);
+        let can_rescan = !self.job.lock().unwrap().running && crate::project_script_root(project).is_dir();
         let global_args = &self.saved.launch_args;
         let global_switches = &self.saved.extra_env;
         let key = project_key(&project.repo);
         let launch = self.saved.project_launch.entry(key.clone()).or_default();
-        ui.push_id(key, |ui| {
-            launch_presets::show(ui, &mut self.saved.launch_presets, launch, global_args, global_switches, project);
-        });
+        let review = ui.push_id(key, |ui| {
+            launch_presets::show(ui, &mut self.saved.launch_presets, launch, global_args, global_switches, project,
+                revision.as_deref(), can_rescan)
+        }).inner;
+        if review.is_some() { self.play_preset_picker = review; }
     }
 
     fn project_notes(&mut self, ui: &mut Ui, project: &Project) {
@@ -946,9 +1015,9 @@ impl App {
 
     /// What the launcher is doing, and its log.
     fn activity(&mut self, ui: &mut Ui) {
-        let (running, failed, stage, has_log, stoppable) = {
+        let (running, failed, stage, has_log, stoppable, warm_status) = {
             let j = self.job.lock().unwrap();
-            (j.running, j.failed, j.stage.clone(), !j.log.is_empty(), j.running && j.stoppable)
+            (j.running, j.failed, j.stage.clone(), !j.log.is_empty(), j.running && j.stoppable, j.warm_status.clone())
         };
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
             theme::caps(ui, "Activity", 11.5, theme::LILAC);
@@ -980,13 +1049,13 @@ impl App {
                 (stage, theme::MUTED)
             };
             ui.label(RichText::new(text).font(theme::regular(13.5)).color(color));
+            if let Some(status) = warm_status {
+                note(ui, &status);
+            }
         });
         if has_log && self.show_log {
             ui.add_space(6.0);
-            let (log, omitted) = {
-                let job = self.job.lock().unwrap();
-                (job.log.join("\n"), job.omitted_log_lines)
-            };
+            let log = self.job.lock().unwrap().log.preview();
             ui.horizontal_wrapped(|ui| {
                 let label = if self.log_expanded { "Collapse" } else { "Expand" };
                 if theme::small(ui, Look::Ghost, None, label, true).clicked() {
@@ -994,13 +1063,13 @@ impl App {
                 }
                 if theme::small(ui, Look::Ghost, Some(glyph::COPY), "Copy log", true).clicked() {
                     ui.ctx().copy_text(log.clone());
-                    self.log_export_status = Some(("Log copied.".into(), false));
+                    self.log_export_status = Some(("Visible log copied.".into(), false));
                 }
                 if theme::small(ui, Look::Ghost, None, "Export log…", true).clicked() {
                     if let Some(path) = rfd::FileDialog::new().set_title("Export Activity log")
                         .set_file_name("mandyhub.log").save_file()
                     {
-                        self.log_export_status = Some(match std::fs::write(path, &log) {
+                        self.log_export_status = Some(match self.job.lock().unwrap().log.export(&path) {
                             Ok(()) => ("Log exported.".into(), false),
                             Err(error) => (format!("Could not export the log: {error}"), true),
                         });
@@ -1009,9 +1078,6 @@ impl App {
             });
             if let Some((message, error)) = &self.log_export_status {
                 wrapped(ui, message, if *error { theme::BAD } else { theme::MUTED });
-            }
-            if omitted > 0 {
-                note(ui, &format!("{omitted} earlier lines have scrolled out of the log buffer."));
             }
             let height = if self.log_expanded { (ui.ctx().screen_rect().height() - 190.0).max(320.0) } else { 240.0 };
             Frame::none()
@@ -1158,7 +1224,7 @@ impl App {
                     ui,
                     &mut self.saved.warm_before_play,
                     "Warm up shaders before playing",
-                    "Runs the warm-up each time you press Play. The first one takes minutes and about 1.3 GB; you can also run it once from a project's page.",
+                    "Checks the shader cache before Play. Scarlett reuses a completed pass for the same build and settings. Activity shows the result, including any shaders that could not translate.",
                 );
                 ui.add_space(14.0);
                 theme::toggle(
@@ -1360,6 +1426,8 @@ impl App {
             let (accepted, dismissed) = picker.show(ctx, t0);
             if !dismissed {
                 if accepted && !running {
+                    let settings_only = picker.settings_only;
+                    let revision = picker.revision.clone();
                     let (project, preset) = picker.into_choice();
                     let key = project_key(&project.repo);
                     let launch = self.saved.project_launch.entry(key.clone()).or_default();
@@ -1369,9 +1437,16 @@ impl App {
                             self.show_log = true;
                             return;
                         }
+                    } else {
+                        // Keep the exact switches already in the profile, even if the old script changed or disappeared.
+                        if self.saved.launch_presets.iter().any(|p| p.repo_script.is_some() && Some(&p.name) == launch.selected_preset.as_ref()) {
+                            launch.selected_preset = None;
+                        }
+                        launch.confirmed_repo_script = None;
                     }
                     launch.preset_choice_confirmed = true;
-                    self.continue_play(ctx, project);
+                    launch.reviewed_script_revision = revision;
+                    if !settings_only { self.continue_play(ctx, project); }
                     ctx.request_repaint();
                 } else {
                     self.play_preset_picker = Some(picker);
