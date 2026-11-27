@@ -10,6 +10,7 @@
 #![windows_subsystem = "windows"]
 
 mod fullscreen;
+mod hardware;
 mod slides;
 mod theme;
 mod tools;
@@ -337,6 +338,7 @@ fn project_launch_overrides_are_independent_and_can_be_empty() {
 #[derive(Default)]
 struct Job {
     running: bool,
+    installing: bool,
     /// The project the job works on.
     repo: Option<String>,
     stage: String,
@@ -352,6 +354,56 @@ struct Job {
     stoppable: bool,
     /// The player pressed Stop.
     stopped: bool,
+}
+
+impl Job {
+    fn pending_project_change(&self) -> bool {
+        self.imported_project.is_some() || self.updated_project.is_some() || self.removed_archive.is_some()
+    }
+}
+
+type JobHandle = Arc<Mutex<Job>>;
+
+/// Only the UI thread admits jobs. Each worker owns its project's progress and output.
+#[derive(Default)]
+struct ProjectJobs(std::collections::BTreeMap<String, JobHandle>);
+
+#[cfg(test)]
+mod project_jobs_tests;
+
+impl ProjectJobs {
+    fn key(repo: &str) -> String {
+        // The directory name is the resource being written, including on case-insensitive Windows.
+        slug(repo).to_lowercase()
+    }
+
+    fn get(&self, repo: &str) -> Option<&JobHandle> {
+        self.0.get(&Self::key(repo))
+    }
+
+    fn blocker(&self, repo: &str, installing: bool) -> Option<JobHandle> {
+        if let Some(job) = self.get(repo).filter(|j| j.lock().unwrap().running) { return Some(job.clone()); }
+        if installing { return None; }
+        self.0.values().find(|handle| {
+            let job = handle.lock().unwrap();
+            job.running && !job.installing
+        }).cloned()
+    }
+
+    fn start(&mut self, repo: &str, installing: bool, stage: &str) -> Option<JobHandle> {
+        if self.blocker(repo, installing).is_some() { return None; }
+        if self.get(repo).is_some_and(|handle| handle.lock().unwrap().pending_project_change()) { return None; }
+        let job = Arc::new(Mutex::new(Job { running: true, installing, repo: Some(repo.into()), stage: stage.into(), ..Job::default() }));
+        self.0.insert(Self::key(repo), job.clone());
+        Some(job)
+    }
+
+    fn running(&self) -> bool {
+        self.0.values().any(|handle| {
+            let j = handle.lock().unwrap();
+            j.running || j.pending_project_change()
+        })
+    }
 }
 
 /// How a project is started, read from the settings when its job starts.
@@ -417,11 +469,15 @@ mod tests {
 }
 
 struct App {
+    hardware: hardware::Panel,
     saved: Saved,
     screenshot_projects: Option<Vec<String>>,
     updater: updater::Updater,
     projects: Arc<Mutex<Option<Result<Vec<Project>, String>>>>,
     job: Arc<Mutex<Job>>,
+    project_jobs: ProjectJobs,
+    // Only the newest ZIP request may select its project when extraction finishes.
+    import_focus: Option<(String, Option<String>, View)>,
     files: Vec<(&'static str, bool)>,
     files_for: String,
     tools: Option<tools::Tools>,
@@ -1021,25 +1077,33 @@ pub(crate) fn hide_window(c: &mut Command) {
 pub(crate) fn hide_window(_: &mut Command) {}
 
 impl App {
+    fn any_job_running(&self) -> bool {
+        self.job.lock().unwrap().running || self.project_jobs.running()
+    }
+
+    fn blocking_job(&self, repo: &str, installing: bool) -> Option<JobHandle> {
+        if self.job.lock().unwrap().running { Some(self.job.clone()) }
+        else { self.project_jobs.blocker(repo, installing) }
+    }
+
     fn import_build_zip(&mut self, ctx: &egui::Context, input: PathBuf) {
+        if self.job.lock().unwrap().running { return; }
         let name = input.file_stem().and_then(|name| name.to_str()).unwrap_or("Imported build").to_owned();
-        let job = self.job.clone();
-        let ctx = ctx.clone();
-        {
-            let mut state = job.lock().unwrap();
-            if state.running {
-                return;
-            }
-            *state = Job { running: true, stage: "Extracting build ZIP".into(), ..Job::default() };
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut id = [0; 16];
+        if SystemRandom::new().fill(&mut id).is_err() {
+            self.job.lock().unwrap().import_error = Some("Could not create a build ID.".into());
+            return;
         }
+        let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
+        let repo = format!("archive://{hex}");
+        let Some(job) = self.project_jobs.start(&repo, true, "Extracting build ZIP") else { return; };
+        job.lock().unwrap().log.push(format!("Importing {name} from {}", input.display()));
+        self.import_focus = Some((repo.clone(), self.saved.selected.clone(), self.view));
+        let ctx = ctx.clone();
         self.log_export_status = None;
         std::thread::spawn(move || {
             let result = (|| -> Result<Project, String> {
-                use ring::rand::{SecureRandom, SystemRandom};
-                let mut id = [0; 16];
-                SystemRandom::new().fill(&mut id).map_err(|_| "Could not create a build ID.")?;
-                let hex: String = id.iter().map(|byte| format!("{byte:02x}")).collect();
-                let repo = format!("archive://{hex}");
                 std::fs::create_dir_all(workspace().join("repos")).map_err(|error| error.to_string())?;
                 let folder = repo_dir(&repo);
                 let executable = build_zip::extract(&input, &folder)?;
@@ -1051,7 +1115,7 @@ impl App {
                     job.lock().unwrap().log.push(format!("Could not record the import date: {error}"));
                 }
                 Ok(Project {
-                    name, repo, archive_exe: Some(executable), custom: true,
+                    name: name.clone(), repo, archive_exe: Some(executable), custom: true,
                     branch: None, gpu: Vec::new(), fps: None, render: None, verified: false,
                     summary: String::new(), local_exe: None,
                 })
@@ -1067,7 +1131,7 @@ impl App {
                     state.stage = "Build import failed".into();
                     state.failed = true;
                     state.log.push(format!("ERROR: {error}"));
-                    state.import_error = Some(error);
+                    state.import_error = Some(format!("{name}: {error}"));
                 }
             }
             ctx.request_repaint();
@@ -1082,11 +1146,14 @@ impl App {
             saved.render_scale = 0.5;
         }
         let mut app = App {
+            hardware: hardware::Panel::default(),
             saved,
             screenshot_projects: None,
             updater: updater::Updater::default(),
             projects: Arc::new(Mutex::new(None)),
             job: Arc::new(Mutex::new(Job::default())),
+            project_jobs: ProjectJobs::default(),
+            import_focus: None,
             files: Vec::new(),
             files_for: String::new(),
             tools: None,
@@ -1215,8 +1282,7 @@ impl App {
         }
         // Not while this project is being installed or updated.
         {
-            let j = self.job.lock().unwrap();
-            if j.running && j.repo.as_deref() == Some(p.repo.as_str()) {
+            if self.project_jobs.get(&p.repo).is_some_and(|j| j.lock().unwrap().running) {
                 return None;
             }
         }
@@ -1233,16 +1299,14 @@ impl App {
     }
 
     fn start(&mut self, ctx: &egui::Context, p: Project, kind: Kind) {
-        let job = self.job.clone();
-        {
-            let mut j = job.lock().unwrap();
-            if j.running {
-                return;
-            }
-            *j = Job { running: true, stage: "Starting".into(), repo: Some(p.repo.clone()), ..Default::default() };
-        }
+        if self.job.lock().unwrap().running { return; }
+        let Some(job) = self.project_jobs.start(&p.repo, kind == Kind::Install, "Starting") else { return; };
         // An install over an installed project is an update.
         let updating = kind == Kind::Install && project_installed(&p.repo);
+        if kind == Kind::Install {
+            let action = if updating { "Updating" } else { "Installing" };
+            job.lock().unwrap().log.push(format!("{action} {} ({})", p.name, p.repo));
+        }
         // Anchor legacy choices to the currently installed commit before a build can replace it.
         if updating && !p.runs_standalone() {
             if let Some(revision) = installed_revision(&p.repo) {
@@ -1287,6 +1351,15 @@ impl App {
                     warm(&job, &ctx, &command, &launch)
                 }),
             };
+            // Publish the final repository state before releasing the project for another operation.
+            if matches!(kind, Kind::Install | Kind::Uninstall) {
+                let st = repo_state(&p);
+                repos.lock().unwrap().insert(p.repo.clone(), st);
+            } else if matches!(kind, Kind::Play(_)) && p.local_exe.is_none() {
+                if let Some(state) = repos.lock().unwrap().get_mut(&p.repo) {
+                    state.activity = build_activity::BuildActivity::read(&target_dir(&p.repo));
+                }
+            }
             {
                 let mut j = job.lock().unwrap();
                 j.running = false;
@@ -1327,14 +1400,6 @@ impl App {
                         };
                         j.log.push(format!("ERROR: {e}"));
                     }
-                }
-            }
-            if matches!(kind, Kind::Install | Kind::Uninstall) {
-                let st = repo_state(&p);
-                repos.lock().unwrap().insert(p.repo.clone(), st);
-            } else if matches!(kind, Kind::Play(_)) && p.local_exe.is_none() {
-                if let Some(state) = repos.lock().unwrap().get_mut(&p.repo) {
-                    state.activity = build_activity::BuildActivity::read(&target_dir(&p.repo));
                 }
             }
             ctx.request_repaint();
@@ -1896,30 +1961,43 @@ impl eframe::App for App {
 
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.updater.poll();
-        let (imported, removed, updated) = {
-            let mut job = self.job.lock().unwrap();
-            (job.imported_project.take(), job.removed_archive.take(), job.updated_project.take())
-        };
-        if let Some(project) = updated {
-            if self.view == View::Projects && self.saved.selected.as_ref() == Some(&project.repo)
+        let mut discarded_archives = Vec::new();
+        for (key, handle) in &self.project_jobs.0 {
+            let (imported, removed, updated) = {
+                let mut job = handle.lock().unwrap();
+                if job.import_error.is_some() {
+                    let mut workspace_job = self.job.lock().unwrap();
+                    if workspace_job.import_error.is_none() {
+                        workspace_job.import_error = job.import_error.take();
+                        discarded_archives.push(key.clone());
+                    }
+                }
+                (job.imported_project.take(), job.removed_archive.take(), job.updated_project.take())
+            };
+            if let Some(project) = updated.filter(|project|
+                self.view == View::Projects && self.saved.selected.as_ref() == Some(&project.repo)
                 && self.screenshot_projects.is_none() && self.add_repo.is_none() && self.confirm_uninstall.is_none()
                 && self.pending_move.is_none() && self.play_preset_picker.is_none() && self.save_picker.is_none()
-            {
+            ) {
                 let launch = self.saved.project_launch.get(&project_key(&project.repo));
                 self.play_preset_picker = ui::PlayPresetPicker::after_project_update(&project, &self.saved.launch_presets, launch);
             }
-        }
-        if let Some(project) = imported {
-            self.saved.selected = Some(project.repo.clone());
-            self.saved.custom.insert(0, project);
-            self.view = View::Projects;
-        }
-        if let Some(repo) = removed {
-            self.saved.custom.retain(|project| project.repo != repo);
-            if self.saved.selected.as_deref() == Some(&repo) {
-                self.saved.selected = None;
+            if let Some(project) = imported {
+                if self.import_focus.as_ref().is_some_and(|(repo, _, _)| repo == &project.repo) {
+                    if self.import_focus.take().is_some_and(|(_, selected, view)| selected == self.saved.selected && view == self.view) {
+                        self.saved.selected = Some(project.repo.clone());
+                        self.view = View::Projects;
+                    }
+                }
+                self.saved.custom.insert(0, project);
+            }
+            if let Some(repo) = removed {
+                discarded_archives.push(key.clone());
+                self.saved.custom.retain(|project| project.repo != repo);
+                if self.saved.selected.as_deref() == Some(&repo) { self.saved.selected = None; }
             }
         }
+        for key in discarded_archives { self.project_jobs.0.remove(&key); }
         if !self.title_bar_done {
             self.title_bar_done = fullscreen::dark_title_bar(std::process::id(), theme::BG, theme::WHITE);
         }
@@ -1934,7 +2012,7 @@ impl eframe::App for App {
             }
         }
         self.draw(ctx);
-        if self.updater.restart_requested && !self.job.lock().unwrap().running {
+        if self.updater.restart_requested && !self.any_job_running() {
             if let updater::State::Downloaded(update) = &self.updater.state {
                 self.updater.restart_requested = false;
                 if let Some(storage) = frame.storage_mut() {
@@ -1955,6 +2033,7 @@ impl eframe::App for App {
 impl App {
     /// Installs what is missing with winget, then looks again.
     fn start_tools(&mut self, ctx: &egui::Context) {
+        if self.project_jobs.running() { return; }
         let job = self.job.clone();
         {
             let mut j = job.lock().unwrap();
@@ -2004,6 +2083,7 @@ impl App {
 
     /// A new install folder: asks first if projects are installed in the old one.
     fn choose_install_dir(&mut self, new: PathBuf) {
+        if self.any_job_running() { return; }
         let old = workspace();
         if new == old {
             return;
@@ -2016,15 +2096,18 @@ impl App {
     }
 
     fn apply_install_dir(&mut self, new: &Path) {
+        if self.any_job_running() { return; }
         self.saved.install_dir = if new == default_workspace() { String::new() } else { new.display().to_string() };
         set_install_dir(&self.saved.install_dir);
         // What is installed where is looked at again.
         self.repos.lock().unwrap().clear();
+        self.project_jobs.0.clear();
         self.last_auto_check = -1.0;
     }
 
     /// Moves every installed project from `old` to `new`, then uses `new`.
     fn start_move(&mut self, ctx: &egui::Context, old: PathBuf, new: PathBuf) {
+        if self.project_jobs.running() { return; }
         let job = self.job.clone();
         {
             let mut j = job.lock().unwrap();

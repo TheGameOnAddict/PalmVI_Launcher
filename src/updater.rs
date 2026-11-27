@@ -131,7 +131,9 @@ fn check_release() -> Result<State, String> {
     };
     let available =
         version(&release.tag_name).ok_or("The release tag is not a supported version.")?;
-    let current = version(env!("CARGO_PKG_VERSION")).ok_or("The installed version is invalid.")?;
+    // Build metadata identifies a local preview in support logs without changing version precedence.
+    let installed = env!("CARGO_PKG_VERSION").split('+').next().unwrap_or_default();
+    let current = version(installed).ok_or("The installed version is invalid.")?;
     if available > current {
         Ok(State::Available(release))
     } else {

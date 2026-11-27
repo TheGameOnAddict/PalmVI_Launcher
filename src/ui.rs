@@ -11,6 +11,61 @@ use std::time::Duration;
 
 mod save_picker;
 mod launch_presets;
+
+#[derive(Clone, Copy, PartialEq)]
+enum ProjectColumn { Profile, System }
+
+fn project_columns(ui: &mut Ui, mut render: impl FnMut(&mut Ui, ProjectColumn)) {
+    const GAP: f32 = 24.0;
+    const SYSTEM_WIDTH: f32 = 280.0;
+    let available = ui.available_width();
+    let wide = available >= 800.0 + GAP + SYSTEM_WIDTH;
+    let profile_width = if wide { available - GAP - SYSTEM_WIDTH } else { available }.min(820.0);
+    let item_gap = ui.spacing().item_spacing.x;
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = GAP;
+        for (column, width) in [(ProjectColumn::Profile, profile_width), (ProjectColumn::System, SYSTEM_WIDTH)] {
+            if column == ProjectColumn::System && !wide { break; }
+            ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(width);
+                ui.spacing_mut().item_spacing.x = item_gap;
+                render(ui, column);
+            });
+        }
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn system_card_tracks_the_profile_edge_as_the_window_widens() {
+    fn measure(width: f32) -> Vec<egui::Rect> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 720.0))),
+            ..Default::default()
+        };
+        let mut columns = Vec::new();
+        let _ = ctx.run(input, |ctx| {
+            egui::CentralPanel::default().frame(Frame::none()).show(ctx, |ui| {
+                project_columns(ui, |ui, _| {
+                    columns.push(ui.max_rect());
+                    ui.label("Content");
+                });
+            });
+        });
+        columns
+    }
+    assert_eq!(measure(1050.0).len(), 1);
+    for width in [1104.0, 1200.0, 1800.0] {
+        let columns = measure(width);
+        assert_eq!(columns.len(), 2);
+        let (profile, system) = (columns[0], columns[1]);
+        assert_eq!(profile.top(), system.top());
+        assert_eq!(system.left() - profile.right(), 24.0);
+        assert_eq!(system.width(), 280.0);
+        assert!(profile.width() <= 820.0 && system.right() <= width);
+    }
+}
 pub(crate) use save_picker::SavePicker;
 mod play_preset_picker;
 pub(crate) use play_preset_picker::PlayPresetPicker;
@@ -202,7 +257,8 @@ impl App {
                     .exact_width(width)
                     .frame(Frame::none().fill(theme::DEEP).inner_margin(Margin { left: 16.0, right: 16.0, top: 18.0, bottom: 0.0 }))
                     .show(ctx, |ui| self.list(ui, ctx));
-                egui::CentralPanel::default().frame(Frame::none().fill(theme::BG)).show(ctx, |ui| self.page(ui, ctx));
+                let selected = self.selected_project();
+                egui::CentralPanel::default().frame(Frame::none().fill(theme::BG)).show(ctx, |ui| self.page(ui, ctx, selected));
             }
             View::Settings => {
                 egui::CentralPanel::default().frame(Frame::none().fill(theme::BG)).show(ctx, |ui| self.settings_page(ui, ctx));
@@ -241,7 +297,11 @@ impl App {
     }
 
     fn status_bar(&mut self, ctx: &egui::Context) {
-        let running = self.job.lock().unwrap().running;
+        let running = self.any_job_running();
+        let installs = self.project_jobs.0.values().filter(|job| {
+            let j = job.lock().unwrap();
+            j.running && j.installing
+        }).count();
         egui::TopBottomPanel::bottom("status")
             .exact_height(42.0)
             .frame(Frame::none().fill(theme::DEEP).inner_margin(Margin::symmetric(20.0, 0.0)))
@@ -268,6 +328,11 @@ impl App {
                     }
                     theme::divider(ui);
                     match self.tools.clone() {
+                        _ if installs > 0 => {
+                            ui.add(egui::Spinner::new().size(12.0).color(theme::PINK));
+                            let label = if installs == 1 { "1 install/update in progress".into() } else { format!("{installs} installs/updates in progress") };
+                            small(ui, &label, theme::MUTED);
+                        }
                         None => {
                             ui.add(egui::Spinner::new().size(12.0).color(theme::FAINT));
                             small(ui, "Checking build tools", theme::FAINT);
@@ -488,9 +553,9 @@ impl App {
 
     /// Where a project stands, when that is more than "listed".
     fn row_status(&self, p: &Project) -> Option<(String, Color32)> {
-        {
-            let j = self.job.lock().unwrap();
-            if j.running && j.repo.as_deref() == Some(p.repo.as_str()) {
+        if let Some(job) = self.project_jobs.get(&p.repo) {
+            let j = job.lock().unwrap();
+            if j.running {
                 return Some((short_stage(&j.stage).to_string(), theme::PINK));
             }
         }
@@ -518,8 +583,8 @@ impl App {
     }
 
     /// The selected project's page.
-    fn page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        let Some(p) = self.selected_project() else {
+    fn page(&mut self, ui: &mut Ui, ctx: &egui::Context, selected: Option<Project>) {
+        let Some(p) = selected else {
             self.shown = None;
             return self.empty_page(ui);
         };
@@ -538,6 +603,7 @@ impl App {
             ctx.data_mut(|data| data.insert_temp(egui::Id::new(profile_tab_key(&p.repo)), 0_usize));
         }
         if just_selected {
+            self.log_export_status = None;
             self.shown = Some(p.repo.clone());
             self.shown_at = now;
         }
@@ -546,10 +612,10 @@ impl App {
         if enter < 1.0 {
             ctx.request_repaint();
         }
-        let playing = {
-            let j = self.job.lock().unwrap();
+        let playing = self.project_jobs.0.values().any(|job| {
+            let j = job.lock().unwrap();
             j.running && j.stage == "Playing"
-        };
+        });
         theme::ground(ui.painter(), ui.max_rect());
         egui::ScrollArea::vertical().id_salt("page").auto_shrink([false; 2]).show(ui, |ui| {
             let pictures = self.screenshot_projects.is_none() && self.slides.ready(ctx);
@@ -563,15 +629,18 @@ impl App {
             }
             let top = if pictures { 0.0 } else { 40.0 };
             Frame::none().inner_margin(Margin { left: 44.0, right: 44.0, top, bottom: 44.0 }).show(ui, |ui| {
-                ui.set_max_width(820.0);
                 ui.set_opacity(enter);
                 ui.add_space(10.0 * (1.0 - enter));
-                self.page_header(ui, ctx, &p);
-                self.profile_tabs(ui, ctx, &p);
-                ui.add_space(36.0);
-                if self.screenshot_projects.is_none() {
-                    self.activity(ui);
-                }
+                project_columns(ui, |ui, column| {
+                    if column == ProjectColumn::System {
+                        self.hardware.show(ui);
+                    } else {
+                        self.page_header(ui, ctx, &p);
+                        self.profile_tabs(ui, ctx, &p);
+                        ui.add_space(36.0);
+                        if self.screenshot_projects.is_none() { self.activity(ui, &p.repo); }
+                    }
+                });
             });
         });
     }
@@ -627,11 +696,6 @@ impl App {
         }
         ui.add_space(20.0);
 
-        let (running, job_repo, stage) = {
-            let j = self.job.lock().unwrap();
-            (j.running, j.repo.clone(), j.stage.clone())
-        };
-        let this_job = running && job_repo.as_deref() == Some(p.repo.as_str());
         let st = match self.state_of(&p.repo) {
             Some(st) => st,
             None => {
@@ -644,6 +708,14 @@ impl App {
             p.archive_program().is_some_and(|exe| exe.is_file())
             || (p.is_git() && project_installed(&p.repo))
         ));
+        let blocker = self.blocking_job(&p.repo, !installed);
+        let running = blocker.is_some();
+        let (job_repo, stage) = blocker.map(|job| {
+            let j = job.lock().unwrap();
+            (j.repo.clone(), j.stage.clone())
+        }).unwrap_or_default();
+        let this_job = self.project_jobs.get(&p.repo).is_some_and(|j| j.lock().unwrap().running);
+        let install_blocked = self.blocking_job(&p.repo, true).is_some();
         let rust = installed.then(|| rust_install(&p.repo)).flatten();
         let victory = !p.runs_standalone();
         let runnable = !victory && (p.archive_exe.is_some() || rust.is_some_and(|install| install.executable.is_some()));
@@ -792,7 +864,7 @@ impl App {
                         .on_hover_text("Translate the game's shaders into this project's cache now, so it does not stop to translate them while you play.").clicked() {
                         self.start(ctx, p.clone(), Kind::Warm);
                     }
-                    if p.is_git() && theme::small(ui, Look::Ghost, Some(glyph::REPAIR), "Reinstall", !running).clicked() {
+                    if p.is_git() && theme::small(ui, Look::Ghost, Some(glyph::REPAIR), "Reinstall", !install_blocked).clicked() {
                         self.start(ctx, p.clone(), Kind::Install);
                     }
                     if theme::small(ui, Look::Danger, Some(glyph::DELETE), "Uninstall", !running).clicked() {
@@ -805,7 +877,7 @@ impl App {
 
     /// Update, the figures from PortWatch, and what the project is.
     fn page_body(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Project) {
-        let running = self.job.lock().unwrap().running;
+        let running = self.blocking_job(&p.repo, true).is_some();
         if let Some(remote) = self.update_for(p) {
             ui.add_space(18.0);
             theme::callout(ui, theme::WARN, glyph::SYNC, |ui| {
@@ -843,10 +915,18 @@ impl App {
             if remove {
                 self.saved.custom.retain(|q| q.repo != p.repo);
                 self.saved.selected = None;
+                return;
             }
-            return;
         }
 
+        let tracker = self.projects.lock().unwrap();
+        let p = if p.custom {
+            let report = tracker.as_ref().and_then(|result| result.as_ref().ok())
+                .and_then(|list| list.iter().find(|q| q.repo.eq_ignore_ascii_case(&p.repo)
+                    && (p.branch.is_none() || q.branch == p.branch)));
+            let Some(report) = report else { return; };
+            report
+        } else { p };
         ui.add_space(30.0);
         let gpu = gpu_text(&p.gpu);
         theme::stats(
@@ -990,7 +1070,7 @@ impl App {
 
     fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {
         let revision = self.state_of(&project.repo).and_then(|s| s.built);
-        let can_rescan = !self.job.lock().unwrap().running && crate::project_script_root(project).is_dir();
+        let can_rescan = self.blocking_job(&project.repo, true).is_none() && crate::project_script_root(project).is_dir();
         let global_args = &self.saved.launch_args;
         let global_switches = &self.saved.extra_env;
         let key = project_key(&project.repo);
@@ -1014,9 +1094,11 @@ impl App {
     }
 
     /// What the launcher is doing, and its log.
-    fn activity(&mut self, ui: &mut Ui) {
+    fn activity(&mut self, ui: &mut Ui, repo: &str) {
+        let job = if self.job.lock().unwrap().running { self.job.clone() }
+            else { self.project_jobs.get(repo).unwrap_or(&self.job).clone() };
         let (running, failed, stage, has_log, stoppable, warm_status) = {
-            let j = self.job.lock().unwrap();
+            let j = job.lock().unwrap();
             (j.running, j.failed, j.stage.clone(), !j.log.is_empty(), j.running && j.stoppable, j.warm_status.clone())
         };
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
@@ -1029,7 +1111,7 @@ impl App {
                     }
                 }
                 if stoppable && theme::small(ui, Look::Danger, Some(glyph::STOP), "Stop", true).clicked() {
-                    self.stop_job();
+                    Self::stop_job(&job);
                 }
             });
         });
@@ -1055,7 +1137,7 @@ impl App {
         });
         if has_log && self.show_log {
             ui.add_space(6.0);
-            let log = self.job.lock().unwrap().log.preview();
+            let log = job.lock().unwrap().log.preview();
             ui.horizontal_wrapped(|ui| {
                 let label = if self.log_expanded { "Collapse" } else { "Expand" };
                 if theme::small(ui, Look::Ghost, None, label, true).clicked() {
@@ -1069,7 +1151,7 @@ impl App {
                     if let Some(path) = rfd::FileDialog::new().set_title("Export Activity log")
                         .set_file_name("mandyhub.log").save_file()
                     {
-                        self.log_export_status = Some(match self.job.lock().unwrap().log.export(&path) {
+                        self.log_export_status = Some(match job.lock().unwrap().log.export(&path) {
                             Ok(()) => ("Log exported.".into(), false),
                             Err(error) => (format!("Could not export the log: {error}"), true),
                         });
@@ -1244,7 +1326,7 @@ impl App {
     }
 
     fn install_folder_card(&mut self, ui: &mut Ui) {
-        let running = self.job.lock().unwrap().running;
+        let running = self.any_job_running();
         section(
             ui,
             "Install folder",
@@ -1306,7 +1388,7 @@ impl App {
         self.credits_card(ui);
         ui.add_space(14.0);
         use crate::updater::{State, RELEASES};
-        let busy = self.job.lock().unwrap().running;
+        let busy = self.any_job_running();
         let card_start = ui.next_widget_position();
         section(ui, "Launcher updates", None, concat!("Mandyhub ", env!("CARGO_PKG_VERSION")), |ui| {
             match &self.updater.state {
@@ -1412,7 +1494,8 @@ impl App {
 
         if let Some(mut picker) = self.save_picker.take() {
             let alias = self.screenshot_alias(&picker.project.repo).map(|(name, _)| name);
-            let (action, dismissed) = picker.show(ctx, t0, !running && self.files_ok(), alias.as_deref());
+            let ready = self.blocking_job(&picker.project.repo, false).is_none() && self.files_ok();
+            let (action, dismissed) = picker.show(ctx, t0, ready, alias.as_deref());
             match action {
                 save_picker::Action::Launch(choice) if !dismissed => {
                     self.start(ctx, picker.project, Kind::Play(choice));
@@ -1425,7 +1508,7 @@ impl App {
         if let Some(mut picker) = self.play_preset_picker.take() {
             let (accepted, dismissed) = picker.show(ctx, t0);
             if !dismissed {
-                if accepted && !running {
+                if accepted && self.blocking_job(&picker.project.repo, picker.settings_only).is_none() {
                     let settings_only = picker.settings_only;
                     let revision = picker.revision.clone();
                     let (project, preset) = picker.into_choice();
@@ -1433,7 +1516,7 @@ impl App {
                     let launch = self.saved.project_launch.entry(key.clone()).or_default();
                     if let Some(preset) = preset {
                         if let Err(error) = launch_presets::apply_to_profile(&mut self.saved.launch_presets, launch, &key, preset) {
-                            self.job.lock().unwrap().log.push(format!("Could not apply launch preset: {error}"));
+                            self.project_jobs.get(&project.repo).unwrap_or(&self.job).lock().unwrap().log.push(format!("Could not apply launch preset: {error}"));
                             self.show_log = true;
                             return;
                         }
@@ -1554,6 +1637,7 @@ impl App {
         }
 
         if let Some((old, new)) = self.pending_move.clone() {
+            let ready = !self.any_job_running();
             let mut close = false;
             let (_, dismissed) = theme::modal(ctx, "move", t0, 520.0, |ui| {
                 theme::caps(ui, "Install folder", 11.5, theme::LILAC);
@@ -1565,12 +1649,12 @@ impl App {
                 ui.add_space(20.0);
                 button_row(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
-                    if theme::button(ui, Look::Primary, None, "Move them").clicked() {
+                    if theme::small(ui, Look::Primary, None, "Move them", ready).clicked() {
                         self.apply_install_dir(&new);
                         self.start_move(ctx, old.clone(), new.clone());
                         close = true;
                     }
-                    if theme::button(ui, Look::Secondary, None, "Don't move them").clicked() {
+                    if theme::small(ui, Look::Secondary, None, "Don't move them", ready).clicked() {
                         self.apply_install_dir(&new);
                         close = true;
                     }
@@ -1586,9 +1670,9 @@ impl App {
     }
 
     /// Ends the running warm-up (its process and the workers it started).
-    fn stop_job(&self) {
+    fn stop_job(job: &crate::JobHandle) {
         let pid = {
-            let mut j = self.job.lock().unwrap();
+            let mut j = job.lock().unwrap();
             j.stopped = true;
             j.pid
         };

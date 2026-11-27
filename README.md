@@ -34,6 +34,7 @@ keeps the files under `deleted-saves` in its install folder for recovery.
 
 ## Launcher features
 
+- **Your system** appears beside the project details in wide windows. CPU and GPU meters compare theoretical compute performance with the corresponding PS5 component. The white mark on each bar indicates 1×. The comparison works offline and uses the bundled model ratings in [hardware-comparison.json](data/hardware-comparison.json).
 - **Projects from PortWatch:** the list of public projects, live, with their reported frame rate, the graphics cards they were made for, and whether PortWatch has verified them.
 - **Custom Git links:** add a Rust project with a Git clone URL from GitHub, GitLab, Codeberg, Gitea, or a self-hosted server.
 - **Rust workspaces:** Mandyhub builds the workspace and starts its program from **Play**. Library-only workspaces show **Built**.
@@ -42,6 +43,7 @@ keeps the files under `deleted-saves` in its install folder for recovery.
 - **Scarlett launch presets** follow the installed script's defaults while preserving profile edits. Warm-up and Play use the same working directory, switches, cache and save folder. With warm-up enabled, Activity shows whether the shader pass ran, reused the cache, or encountered a problem. Pipeline warm-up has its own result in the exported log.
 - **Rescan scripts** in **Launch settings → Saved presets** to choose from the installed project's supported PowerShell launch scripts. After a project update, Mandyhub offers a fresh selection and remembers it for that revision. Re-selecting the same script preserves your profile edits.
 - **Project updates** pulse yellow on the project's **Check for updates** button. Selecting a project with an available update or finding one through a manual check opens **Overview**, where you can choose **Update now**.
+- **Parallel installs and updates** let you start another project's install, update, or ZIP import while one is running. The bottom bar counts active installs and updates. Select a project to see its progress and copy or export its Activity log.
 - **Install once, play many times:** a project is downloaded and built on your PC once and stays installed.
 - **Updates:** installed projects are checked for new versions at start and every 15 minutes; an update can be installed now or later.
 - **Install folder:** choose where projects are downloaded and built (a big drive is best); installed projects can be moved there.
