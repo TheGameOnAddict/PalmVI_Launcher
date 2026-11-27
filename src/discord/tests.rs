@@ -6,6 +6,7 @@ use windows_sys::Win32::{Foundation::INVALID_HANDLE_VALUE, System::Pipes::Create
 fn lifecycle_selects_the_game_only_while_its_process_is_alive() {
     let defaults: Settings = serde_json::from_str("{}").unwrap();
     let game = app_id(&defaults.game_id).unwrap();
+    assert_eq!(game, 1445160676522856458);
     assert!(defaults.enabled && defaults.launcher_id.is_empty());
     assert!(!serde_json::from_str::<Settings>(r#"{"enabled":false}"#).unwrap().enabled);
     let mut state = State::default();
@@ -78,7 +79,7 @@ fn local_pipe_handshake_publish_ping_acknowledge_and_clear() {
     assert_eq!(op, 1);
     assert_eq!(
         command["args"]["activity"],
-        json!({"type":0, "details":"Newer Retail Game", "status_display_type":2, "timestamps":{"start":1234}})
+        json!({"type":0, "status_display_type":0, "timestamps":{"start":1234}})
     );
     assert_eq!(command["args"]["pid"], std::process::id());
     frame(

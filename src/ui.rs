@@ -974,6 +974,7 @@ impl App {
                 ui.hyperlink_to("TheGameOnAddict", "https://github.com/TheGameOnAddict");
                 note(ui, "Save picker, checkpoints, project settings, notes, build tracking, and compatibility improvements");
             });
+            ui.hyperlink_to("Check out PentatonicPiarucu’s launcher", "https://www.viportlive.com/");
             wrapped(ui, "No game files are included or downloaded: you need your own copy of the game.", theme::faint());
             wrapped(ui, "Display type: Josefin Sans and Big Shoulders Display, under the SIL Open Font License.", theme::faint());
             ui.add_space(10.0);

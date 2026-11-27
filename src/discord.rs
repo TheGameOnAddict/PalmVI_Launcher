@@ -141,7 +141,7 @@ impl State {
 fn activity_command(activity: Option<Activity>) -> Value {
     let value = match activity {
         Some(Activity::Game { start, .. }) => json!({
-            "type": 0, "details": "Newer Retail Game", "status_display_type": 2,
+            "type": 0, "status_display_type": 0,
             "timestamps": { "start": start }
         }),
         Some(Activity::Launcher) => {

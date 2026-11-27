@@ -28,7 +28,7 @@ Each profile brings together its launch controls, graphics, saves, notes, live l
 
 Choose a wallpaper, import a background image, adjust the workspace colors and change the frosted glass in Settings. The CPU and GPU bars at the top open the system comparison.
 
-Discord Rich Presence is on by default. Supported game launches show **Newer Retail Game** with elapsed time while Discord desktop is running. You can turn this off in Settings. Idle presence requires a separately configured launcher application ID.
+Discord Rich Presence is on by default for **Newer Retail Game**. During a supported launch, Discord displays the registered game activity and elapsed playtime. You can turn this off in Settings. Idle presence requires a separately configured launcher application ID.
 
 ## Graphics settings
 
@@ -116,3 +116,5 @@ PalmVI builds on the original Mandyhub launcher by **Zettrox**. Project list fro
 
 - [ellion369](https://github.com/ellion369) designed and implemented the launcher redesign.
 - [TheGameOnAddict](https://github.com/TheGameOnAddict) maintains PalmVI and contributed its workspace, save tools, per-project settings, playtime and FPS tracking, compatibility fixes and updater.
+
+Looking for another community launcher? Check out [PentatonicPiarucu’s launcher](https://www.viportlive.com/).

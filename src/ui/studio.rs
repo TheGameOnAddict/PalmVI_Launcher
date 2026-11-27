@@ -1141,7 +1141,7 @@ impl App {
                             theme::card(ui, 16.0, |ui| {
                                 ui.heading("Discord Rich Presence");
                                 ui.checkbox(&mut self.saved.discord.enabled, "Show gameplay on Discord");
-                                note(ui, "Shows Newer Retail Game and elapsed play time while the game is running.");
+                                note(ui, "Shows the game’s registered Discord name and elapsed playtime while it is running.");
                                 if self.saved.discord.enabled {
                                     note(ui, self.presence.status());
                                     egui::CollapsingHeader::new("Discord application IDs").show(ui, |ui| {
