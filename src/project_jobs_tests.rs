@@ -27,7 +27,9 @@ fn install_and_update_two_local_git_projects() {
         let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let root = std::env::temp_dir().join(format!("mandyhub-parallel-{nonce}"));
         fs::create_dir(&root).unwrap();
-        let result = Command::new(std::env::current_exe().unwrap()).env(FIXTURE, &root)
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        hide_window(&mut child);
+        let result = child.env(FIXTURE, &root).env("LOCALAPPDATA", &root)
             .args(["--exact", "project_jobs_tests::install_and_update_two_local_git_projects", "--ignored", "--nocapture"]).output();
         fs::remove_dir_all(&root).unwrap();
         let result = result.unwrap();
@@ -38,7 +40,9 @@ fn install_and_update_two_local_git_projects() {
     let install_root = root.join("installed");
     set_install_dir(install_root.to_str().unwrap());
     let git = |dir: &Path, args: &[&str]| {
-        let output = tools::git().current_dir(dir)
+        let mut git = tools::git();
+        hide_window(&mut git);
+        let output = git.current_dir(dir)
             .args(["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=.git/no-hooks"])
             .args(args).output().unwrap();
@@ -59,12 +63,12 @@ fn install_and_update_two_local_git_projects() {
             local_exe: None, archive_exe: None }
     };
     let first = fixture("fixture_a");
-    let second = fixture("fixture_b");
+    let mut second = fixture("fixture_b");
+    // PortWatch also lists standalone workspaces without a victory package.
+    second.custom = false;
     let mut jobs = ProjectJobs::default();
     let ctx = egui::Context::default();
-    let initial = jobs.start(&first.repo, true, "Install").unwrap();
-    install(&initial, &ctx, &first, false).unwrap_or_else(|e| panic!("{e}\n{}", initial.lock().unwrap().log.preview()));
-    initial.lock().unwrap().running = false;
+    ui::click_library_build(&first, "Install");
     let before = installed_revision(&first.repo).unwrap();
     git(&root.join(&first.name), &["commit", "--allow-empty", "-qm", "Update"]);
     let mut run_pair = |second_is_update| {
@@ -90,6 +94,8 @@ fn install_and_update_two_local_git_projects() {
         git(&root.join(&project.name), &["commit", "--allow-empty", "-qm", "Next"]);
     }
     run_pair(true);
+    git(&root.join(&first.name), &["commit", "--allow-empty", "-qm", "Library update"]);
+    ui::click_library_build(&first, "Update");
     for project in [&first, &second] {
         assert_eq!(installed_revision(&project.repo).unwrap(), git(&root.join(&project.name), &["rev-parse", "HEAD"]));
         let program = rust_install(&project.repo).unwrap().executable.unwrap();

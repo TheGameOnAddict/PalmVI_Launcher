@@ -102,6 +102,21 @@ impl ActivityLog {
         output
     }
 
+    pub fn save_session(&mut self,project:&str,action:&str){
+        use std::sync::atomic::{AtomicU64,Ordering};
+        static NEXT:AtomicU64=AtomicU64::new(0);
+        let now=SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis();
+        let name:String=project.chars().take(64).map(|c|if c.is_alphanumeric()||" -_".contains(c){c}else{'_'}).collect();
+        let dir=crate::default_workspace().join("session-logs");
+        let id=NEXT.fetch_add(1,Ordering::Relaxed);
+        let path=dir.join(format!("{now}-{}-{id} - {name} - {action}.log",std::process::id()));
+        let temp=path.with_extension("pending");
+        if let Err(error)=fs::create_dir_all(&dir).and_then(|_|self.export(&temp)).and_then(|_|fs::rename(&temp,&path)){
+            self.push(format!("Could not save session history: {error}"));
+            let _=fs::remove_file(temp);
+        }
+    }
+
     pub fn export(&self, path: &Path) -> io::Result<()> {
         let mut output = BufWriter::new(File::create(path)?);
         output.write_all(self.header().as_bytes())?;

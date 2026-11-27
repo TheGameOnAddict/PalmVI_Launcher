@@ -1,8 +1,8 @@
 [package]
 name = "mandyhub"
-version = "0.2.5"
+version = "0.3.0"
 edition = "2021"
-description = "Mandyhub: a community launcher for VIctory-based projects: pick a repo from PortWatch or a custom link, check the game files, build and play."
+description = "PalmVI desktop launcher for VIctory builds, ZIP imports and Rust workspaces."
 license = "GPL-3.0-or-later"
 
 [dependencies]
@@ -14,7 +14,7 @@ url = "2"
 rfd = "0.14"
 ring = "0.17"
 zip = { version = "9.8.2", default-features = false, features = ["deflate"] }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Time", "Win32_System_Pipes", "Win32_UI_WindowsAndMessaging", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm"] }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -23,3 +23,9 @@ windows = { version = "0.62", features = ["Win32_Graphics_Dxgi", "Win32_System_P
 [profile.release]
 opt-level = 3
 strip = true
+
+[build-dependencies]
+find-msvc-tools = "0.1"
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Security", "Win32_Storage_FileSystem"] }

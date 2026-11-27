@@ -16,9 +16,10 @@ pub fn folder() -> PathBuf {
     base.join("Mandyhub").join("backgrounds")
 }
 
+#[derive(Default)]
 pub struct Slides {
-    decoded: Arc<Mutex<Vec<egui::ColorImage>>>,
-    textures: Vec<egui::TextureHandle>,
+    decoded: Arc<Mutex<Vec<(egui::ColorImage, egui::ColorImage)>>>,
+    textures: Vec<(egui::TextureHandle, egui::TextureHandle)>,
 }
 
 impl Slides {
@@ -42,7 +43,9 @@ impl Slides {
                 let img = if img.width() > 1920 { img.resize(1920, 1920, image::imageops::FilterType::Triangle) } else { img };
                 let rgba = img.to_rgba8();
                 let size = [rgba.width() as usize, rgba.height() as usize];
-                out.lock().unwrap().push(egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()));
+                let blur = img.thumbnail(180, 180).blur(4.0).to_rgba8();
+                let blurred = egui::ColorImage::from_rgba_unmultiplied([blur.width() as usize, blur.height() as usize], blur.as_raw());
+                out.lock().unwrap().push((egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw()), blurred));
             }
         });
         Slides { decoded, textures: Vec::new() }
@@ -50,9 +53,9 @@ impl Slides {
 
     /// Takes in the pictures read so far; true when there is one to show.
     pub fn ready(&mut self, ctx: &egui::Context) -> bool {
-        for img in self.decoded.lock().unwrap().drain(..) {
+        for (img, blur) in self.decoded.lock().unwrap().drain(..) {
             let name = format!("slide-{}", self.textures.len());
-            self.textures.push(ctx.load_texture(name, img, egui::TextureOptions::LINEAR));
+            self.textures.push((ctx.load_texture(&name, img, egui::TextureOptions::LINEAR), ctx.load_texture(format!("{name}-glass"), blur, egui::TextureOptions::LINEAR)));
         }
         !self.textures.is_empty()
     }
@@ -68,7 +71,7 @@ impl Slides {
         let local = t - k as f32 * HOLD;
         // The picture now, and the one before it while this one fades in.
         let draw = |idx: usize, since: f32, alpha: f32| {
-            let tex = &self.textures[idx % n];
+            let (tex, blur) = &self.textures[idx % n];
             let [w, h] = tex.size();
             let (img_aspect, box_aspect) = (w as f32 / h as f32, rect.width() / rect.height());
             // Cover the box: crop the picture to its shape.
@@ -86,6 +89,7 @@ impl Slides {
             };
             let (cx, cy) = (0.5 + dir.0 * (1.0 - uw) * 0.5 * (p - 0.5), 0.5 + dir.1 * (1.0 - uh) * 0.5 * (p - 0.5));
             let uv = Rect::from_center_size(Pos2::new(cx, cy), egui::vec2(uw, uh));
+            if alpha >= 0.5 { crate::theme::set_wall_glass(Some((blur.id(), rect, uv))); }
             painter.image(tex.id(), rect, uv, Color32::from_white_alpha((alpha.clamp(0.0, 1.0) * 255.0) as u8));
         };
         if local < FADE && k > 0 {

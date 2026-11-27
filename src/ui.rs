@@ -9,63 +9,35 @@ use crate::{AddRepo, App, GraphicsSettings, Kind, OutputResolution, Project, Pro
 use eframe::egui::{self, vec2, Align, Color32, Frame, Label, Layout, Margin, RichText, Sense, Stroke, Ui};
 use std::time::Duration;
 
-mod save_picker;
-mod launch_presets;
+fn fps_filter(ui: &mut Ui, include_exact_60: &mut bool) {
+    let mut exclude = !*include_exact_60;
+    if ui.checkbox(&mut exclude, "Exclude exactly 60 FPS")
+        .on_hover_text("Applies to all project averages and Library sorting. Uses readings collected since this filter was added.")
+        .changed() { *include_exact_60 = !exclude; }
+}
 
-#[derive(Clone, Copy, PartialEq)]
-enum ProjectColumn { Profile, System }
-
-fn project_columns(ui: &mut Ui, mut render: impl FnMut(&mut Ui, ProjectColumn)) {
-    const GAP: f32 = 24.0;
-    const SYSTEM_WIDTH: f32 = 280.0;
-    let available = ui.available_width();
-    let wide = available >= 800.0 + GAP + SYSTEM_WIDTH;
-    let profile_width = if wide { available - GAP - SYSTEM_WIDTH } else { available }.min(820.0);
-    let item_gap = ui.spacing().item_spacing.x;
-    ui.horizontal_top(|ui| {
-        ui.spacing_mut().item_spacing.x = GAP;
-        for (column, width) in [(ProjectColumn::Profile, profile_width), (ProjectColumn::System, SYSTEM_WIDTH)] {
-            if column == ProjectColumn::System && !wide { break; }
-            ui.allocate_ui_with_layout(vec2(width, 0.0), Layout::top_down(Align::Min), |ui| {
-                ui.set_width(width);
-                ui.spacing_mut().item_spacing.x = item_gap;
-                render(ui, column);
-            });
-        }
-    });
+fn profile_stat_card(ui: &mut Ui, width: f32, label: &str, value: &str, options: bool) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(width, 48.0), if options { Sense::click() } else { Sense::hover() });
+    let painter = ui.painter();
+    painter.add(theme::glass_surface(rect, 11.0, theme::raised()));
+    painter.rect_stroke(rect, 11.0, Stroke::new(1.0_f32, if options && response.hovered() { theme::pink() } else { theme::line() }));
+    let left = rect.left() + 11.0;
+    painter.text(egui::pos2(left, rect.top() + 7.0), egui::Align2::LEFT_TOP, label, theme::strong(9.5), theme::muted());
+    painter.text(egui::pos2(left, rect.bottom() - 5.0), egui::Align2::LEFT_BOTTOM, value, theme::strong(17.0), theme::white());
+    if options {
+        let tip = egui::pos2(rect.right() - 14.0, rect.top() + 16.0);
+        painter.add(egui::Shape::line(vec![tip - vec2(3.5, 3.5), tip, tip + vec2(3.5, -3.5)], Stroke::new(1.5_f32, theme::muted())));
+        response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("FPS filter and reset")
+    } else { response }
 }
 
 #[cfg(test)]
-#[test]
-fn system_card_tracks_the_profile_edge_as_the_window_widens() {
-    fn measure(width: f32) -> Vec<egui::Rect> {
-        let ctx = egui::Context::default();
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, vec2(width, 720.0))),
-            ..Default::default()
-        };
-        let mut columns = Vec::new();
-        let _ = ctx.run(input, |ctx| {
-            egui::CentralPanel::default().frame(Frame::none()).show(ctx, |ui| {
-                project_columns(ui, |ui, _| {
-                    columns.push(ui.max_rect());
-                    ui.label("Content");
-                });
-            });
-        });
-        columns
-    }
-    assert_eq!(measure(1050.0).len(), 1);
-    for width in [1104.0, 1200.0, 1800.0] {
-        let columns = measure(width);
-        assert_eq!(columns.len(), 2);
-        let (profile, system) = (columns[0], columns[1]);
-        assert_eq!(profile.top(), system.top());
-        assert_eq!(system.left() - profile.right(), 24.0);
-        assert_eq!(system.width(), 280.0);
-        assert!(profile.width() <= 820.0 && system.right() <= width);
-    }
-}
+pub(crate) use studio::tests::click_library_build;
+mod studio;
+pub(crate) use studio::{Appearance, Studio, MIDNIGHT};
+mod save_picker;
+mod launch_presets;
+
 pub(crate) use save_picker::SavePicker;
 mod play_preset_picker;
 pub(crate) use play_preset_picker::PlayPresetPicker;
@@ -76,8 +48,6 @@ const MODES: [(&str, bool, f32, &str); 3] = [
     ("Balanced", true, 0.75, "Renders at three quarters and scales up."),
     ("Best quality", false, 1.0, "Renders at full resolution."),
 ];
-const PROJECT_GRAPHICS_WIDTH: f32 = 310.0;
-const GRAPHICS_BAND_HEIGHT: f32 = 40.0;
 
 fn profile_tab_key(repo: &str) -> String {
     format!("project-profile-tab:{repo}")
@@ -95,7 +65,7 @@ fn project_check_button(ctx: &egui::Context, feedback: Option<ProjectCheckFeedba
             let pulse = 0.75 + 0.25 * (age * std::f32::consts::TAU).cos();
             let fade = (3.0 - age).min(1.0);
             ctx.request_repaint_after(Duration::from_millis(40));
-            return (label, Look::Signal(theme::BAD, pulse * fade));
+            return (label, Look::Signal(theme::bad(), pulse * fade));
         }
     }
     let look = if available {
@@ -113,11 +83,11 @@ fn project_check_button_fades_back_after_a_manual_result() {
     let ctx = egui::Context::default();
     let (label, look) = project_check_button(&ctx, None, true, 0.0);
     assert_eq!(label, "Check for updates");
-    assert!(matches!(look, Look::Signal(color, _) if color != theme::BAD));
+    assert!(matches!(look, Look::Signal(color, _) if color != theme::bad()));
     let current = std::time::Instant::now();
     let (label, look) = project_check_button(&ctx, Some(ProjectCheckFeedback::Current(current)), false, 0.0);
     assert_eq!(label, "No new update found");
-    assert!(matches!(look, Look::Signal(color, _) if color == theme::BAD));
+    assert!(matches!(look, Look::Signal(color, _) if color == theme::bad()));
     let past = current - Duration::from_secs(4);
     let (label, look) = project_check_button(&ctx, Some(ProjectCheckFeedback::Current(past)), false, 4.0);
     assert_eq!(label, "Check for updates");
@@ -126,7 +96,7 @@ fn project_check_button_fades_back_after_a_manual_result() {
 }
 
 fn note(ui: &mut Ui, text: &str) {
-    ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::FAINT));
+    ui.label(RichText::new(text).font(theme::regular(13.0)).color(theme::faint()));
 }
 
 fn wrapped(ui: &mut Ui, text: &str, color: Color32) {
@@ -152,7 +122,15 @@ fn graphics_controls(ui: &mut Ui, graphics: &mut GraphicsSettings) {
         );
         note(ui, &description);
     });
-    ui.add_space(20.0);
+    ui.horizontal_wrapped(|ui|{
+        ui.label("Console profile");ui.selectable_value(&mut graphics.series_s,true,"Series S");ui.selectable_value(&mut graphics.series_s,false,"Series X");
+    });
+    ui.horizontal_wrapped(|ui|{
+        ui.label("Output resolution");
+        for resolution in OutputResolution::OPTIONS{ui.selectable_value(&mut graphics.output,resolution,resolution.label());}
+    });
+    note(ui,"Output resolution requires support in the selected build.");
+    ui.add_space(12.0);
     graphics_options(ui, graphics);
 }
 
@@ -165,30 +143,17 @@ fn graphics_options(ui: &mut Ui, graphics: &mut GraphicsSettings) {
 }
 
 /// A list heading, in line with the text of the rows under it.
-fn group(ui: &mut Ui, text: &str, count: Option<usize>) {
-    // More air above than below: it heads the rows, not the controls over it.
-    ui.add_space(14.0);
-    ui.horizontal(|ui| {
-        ui.add_space(14.0);
-        theme::caps(ui, text, 10.5, theme::LILAC);
-        if let Some(n) = count {
-            theme::caps(ui, &n.to_string(), 10.5, theme::FAINT);
-        }
-    });
-}
-
-/// A settings section: a card with a name, a line on what it is for, and its controls.
 fn section(ui: &mut Ui, name: &str, badge: Option<&str>, intro: &str, add: impl FnOnce(&mut Ui)) {
     theme::card(ui, 24.0, |ui| {
         ui.horizontal(|ui| {
-            theme::caps(ui, name, 13.0, theme::WHITE);
+            ui.label(RichText::new(name).font(theme::strong(20.0)).color(theme::white()));
             if let Some(b) = badge {
-                theme::badge(ui, b, theme::WARN);
+                theme::badge(ui, b, theme::warn());
             }
         });
         if !intro.is_empty() {
             ui.add_space(2.0);
-            wrapped(ui, intro, theme::FAINT);
+            wrapped(ui, intro, theme::faint());
         }
         ui.add_space(14.0);
         add(ui);
@@ -247,323 +212,25 @@ impl App {
         }
         self.check_files();
 
-        self.top_bar(ctx);
-        self.status_bar(ctx);
-        match self.view {
-            View::Projects => {
-                let width = (ctx.screen_rect().width() * 0.28).clamp(300.0, 380.0);
-                egui::SidePanel::left("list")
-                    .resizable(false)
-                    .exact_width(width)
-                    .frame(Frame::none().fill(theme::DEEP).inner_margin(Margin { left: 16.0, right: 16.0, top: 18.0, bottom: 0.0 }))
-                    .show(ctx, |ui| self.list(ui, ctx));
-                let selected = self.selected_project();
-                egui::CentralPanel::default().frame(Frame::none().fill(theme::BG)).show(ctx, |ui| self.page(ui, ctx, selected));
-            }
-            View::Settings => {
-                egui::CentralPanel::default().frame(Frame::none().fill(theme::BG)).show(ctx, |ui| self.settings_page(ui, ctx));
-            }
-        }
+        self.draw_workspace(ctx);
         self.auto_check(ctx);
         self.dialogs(ctx);
     }
 
-    /// The sunset strip: the name, the two pages, and adding a repo.
-    fn top_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("top")
-            .exact_height(56.0)
-            .show_separator_line(false)
-            .frame(Frame::none().inner_margin(Margin::symmetric(24.0, 0.0)))
-            .show(ctx, |ui| {
-                theme::strip(ui.painter(), ui.max_rect() + Margin::symmetric(24.0, 0.0));
-                ui.horizontal_centered(|ui| {
-                    ui.label(RichText::new("MANDYHUB").font(theme::deco(16.0)).color(theme::PLUM).extra_letter_spacing(3.8));
-                    ui.add_space(22.0);
-                    if let Some(i) = theme::tabs(ui, "views", &["Projects", "Settings"], self.view as usize) {
-                        self.view = if i == 0 { View::Projects } else { View::Settings };
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if self.screenshot_projects.is_none() && theme::button(ui, Look::Night, Some(glyph::ADD), "Import Repo/Zip").clicked() {
-                            self.open_add_repo();
-                        }
-                        if matches!(self.updater.state, crate::updater::State::Available(_))
-                            && theme::button(ui, Look::Night, Some(glyph::DOWNLOAD), "Launcher update").clicked()
-                        {
-                            self.open_launcher_updates(ctx);
-                        }
-                    });
-                });
-            });
-    }
-
-    fn status_bar(&mut self, ctx: &egui::Context) {
-        let running = self.any_job_running();
-        let installs = self.project_jobs.0.values().filter(|job| {
-            let j = job.lock().unwrap();
-            j.running && j.installing
-        }).count();
-        egui::TopBottomPanel::bottom("status")
-            .exact_height(42.0)
-            .frame(Frame::none().fill(theme::DEEP).inner_margin(Margin::symmetric(20.0, 0.0)))
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    let small = |ui: &mut Ui, text: &str, color: Color32| {
-                        ui.label(RichText::new(text).font(theme::regular(13.0)).color(color));
-                    };
-                    if self.files_ok() {
-                        theme::dot(ui, theme::GOOD);
-                        small(ui, "Game files found", theme::MUTED);
-                        let dir = if self.screenshot_projects.is_some() { "Path hidden".into() } else { self.saved.game_dir.clone() };
-                        let path_width = (ui.available_width() - 640.0).clamp(60.0, 300.0);
-                        ui.allocate_ui(vec2(path_width, 20.0), |ui| {
-                            ui.add(Label::new(RichText::new(dir).font(theme::regular(12.5)).color(theme::FAINT)).truncate());
-                        });
-                    } else {
-                        theme::dot(ui, theme::BAD);
-                        small(ui, "Game files not found", theme::WHITE);
-                        if theme::small(ui, Look::Ghost, Some(glyph::FOLDER), "Choose folder", true).clicked() {
-                            self.pick_game_folder();
-                        }
-                    }
-                    theme::divider(ui);
-                    match self.tools.clone() {
-                        _ if installs > 0 => {
-                            ui.add(egui::Spinner::new().size(12.0).color(theme::PINK));
-                            let label = if installs == 1 { "1 install/update in progress".into() } else { format!("{installs} installs/updates in progress") };
-                            small(ui, &label, theme::MUTED);
-                        }
-                        None => {
-                            ui.add(egui::Spinner::new().size(12.0).color(theme::FAINT));
-                            small(ui, "Checking build tools", theme::FAINT);
-                        }
-                        Some(t) if t.ready() => {
-                            theme::dot(ui, theme::GOOD);
-                            small(ui, "Build tools ready", theme::MUTED);
-                        }
-                        Some(t) => {
-                            theme::dot(ui, theme::WARN);
-                            small(ui, &format!("Missing {}", t.missing().join(", ")), theme::WHITE);
-                            if theme::small(ui, Look::Ghost, Some(glyph::DOWNLOAD), "Install tools", !running).clicked() {
-                                self.start_tools(ctx);
-                            }
-                        }
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let mut screenshot = self.screenshot_projects.is_some();
-                        if ui.checkbox(&mut screenshot, "Screenshot mode").on_hover_text("Replace repo names and hide private text for screenshots").changed() {
-                            self.screenshot_projects = screenshot.then(|| self.all_projects().into_iter().map(|project| project.repo).collect());
-                        }
-                        theme::divider(ui);
-                        let label = format!("Default graphics: {}", self.mode_name());
-                        if theme::small(ui, Look::Ghost, Some(glyph::SETTINGS), &label, true).clicked() {
-                            self.view = View::Settings;
-                        }
-                        theme::divider(ui);
-                        let ready = !matches!(self.updater.state, crate::updater::State::Checking | crate::updater::State::Downloading);
-                        if theme::small(ui, Look::Ghost, Some(glyph::SYNC), "Check for update", ready).clicked() {
-                            self.updater.check(ctx);
-                            self.open_launcher_updates(ctx);
-                        }
-                    });
-                });
-            });
-    }
-
-    fn list(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        // The controls stop where the rows stop: the 10 px past that is the scroll bar's.
-        ui.horizontal(|ui| {
-            let w = ui.available_width() - 10.0 - theme::CONTROL_H - ui.spacing().item_spacing.x;
-            if self.screenshot_projects.is_some() {
-                theme::field(ui, &mut String::new(), "Search hidden", w, Some(glyph::SEARCH));
-            } else {
-                theme::field(ui, &mut self.search, "Search projects", w, Some(glyph::SEARCH));
-            }
-            if theme::icon_button(ui, Look::Secondary, Size::Normal, glyph::REFRESH, "Reload the list from PortWatch").clicked() {
-                self.refresh_projects(ctx);
-            }
-        });
-        let w = ui.available_width() - 10.0;
-        if let Some(i) = theme::segmented(ui, "gpu", &["All", "NVIDIA", "AMD"], Some(self.saved.gpu_filter.min(2)), Some(w)) {
-            self.saved.gpu_filter = i;
-        }
-        ui.horizontal_wrapped(|ui| {
-            theme::dot(ui, theme::GOOD);
-            note(ui, "New install to try");
-            ui.add_space(6.0);
-            theme::dot(ui, theme::PINK);
-            note(ui, "Update to try");
-        });
-
-        let query = if self.screenshot_projects.is_some() { String::new() } else { self.search.trim().to_lowercase() };
-        let filter = self.saved.gpu_filter;
-        let keep = |p: &Project| {
-            let text = query.is_empty() || p.name.to_lowercase().contains(&query) || p.repo.to_lowercase().contains(&query);
-            let card = |name: &str| p.custom || p.gpu.iter().any(|g| g.eq_ignore_ascii_case(name));
-            text && match filter {
-                1 => card("nvidia"),
-                2 => card("amd"),
-                _ => true,
-            }
-        };
-        let custom: Vec<Project> = self.saved.custom.iter().filter(|p| keep(p)).cloned().collect();
-        let listed = self.projects.lock().unwrap().clone();
-        let (mut pick, mut retry) = (None, false);
-        let out = egui::ScrollArea::vertical().id_salt("list").auto_shrink([false; 2]).show(ui, |ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            if !custom.is_empty() {
-                group(ui, "Your repos", Some(custom.len()));
-                for p in &custom {
-                    if self.row(ui, p).clicked() {
-                        pick = Some(p.repo.clone());
-                    }
-                }
-                ui.add_space(14.0);
-            }
-            match &listed {
-                None => {
-                    group(ui, "From PortWatch", None);
-                    ui.horizontal(|ui| {
-                        ui.add_space(14.0);
-                        ui.add(egui::Spinner::new().size(12.0).color(theme::FAINT));
-                        note(ui, "Loading the list");
-                    });
-                }
-                Some(Err(e)) => {
-                    group(ui, "From PortWatch", None);
-                    theme::callout(ui, theme::BAD, glyph::WARNING, |ui| {
-                        wrapped(ui, if self.screenshot_projects.is_some() { "Project list unavailable." } else { e }, theme::MUTED);
-                        if theme::small(ui, Look::Secondary, Some(glyph::REFRESH), "Try again", true).clicked() {
-                            retry = true;
-                        }
-                    });
-                }
-                Some(Ok(list)) => {
-                    let shown: Vec<&Project> = list.iter().filter(|p| keep(p)).collect();
-                    group(ui, "From PortWatch", Some(shown.len()));
-                    if shown.is_empty() {
-                        ui.horizontal(|ui| {
-                            ui.add_space(14.0);
-                            note(ui, "No projects match.");
-                        });
-                    }
-                    for p in shown {
-                        if self.row(ui, p).clicked() {
-                            pick = Some(p.repo.clone());
-                        }
-                    }
-                }
-            }
-            ui.add_space(16.0);
-        });
-        // While more rows are below, the list fades out at the bottom instead of stopping hard.
-        let r = out.inner_rect;
-        if out.content_size.y - out.state.offset.y - r.height() > 1.0 {
-            let fade = egui::Rect::from_min_max(egui::pos2(r.left(), r.bottom() - 40.0), r.right_bottom());
-            theme::fade_bottom(ui.painter(), fade, theme::DEEP);
-        }
-        if let Some(r) = pick {
-            self.saved.selected = Some(r);
-        }
-        if retry {
-            self.refresh_projects(ctx);
-        }
-    }
-
-    /// One project in the list: its name, frame rate, repo and where it stands.
-    fn row(&self, ui: &mut Ui, p: &Project) -> egui::Response {
-        let selected = self.saved.selected.as_deref() == Some(p.repo.as_str());
-        // A gutter on the right keeps the scroll bar off the rows.
-        let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width() - 10.0, 60.0), Sense::click());
-        if !ui.is_rect_visible(rect) {
-            return resp;
-        }
-        let ctx = ui.ctx().clone();
-        let hovered = resp.hovered();
-        let t = ctx.animate_bool_with_time(resp.id.with("hover"), hovered, if hovered { 0.15 } else { 0.12 });
-        let sel = ctx.animate_bool_with_time(resp.id.with("sel"), selected, 0.15);
-        let painter = ui.painter().clone();
-        // One quiet card for the picked row; hover is a lighter step of the same.
-        let fill = theme::mix(theme::mix(Color32::TRANSPARENT, theme::SURFACE, t), theme::RAISED, sel);
-        painter.rect(rect, theme::R, fill, Stroke::new(1.0, theme::LINE_STRONG.gamma_multiply(sel)));
-        let (left, right) = (rect.left() + 14.0, rect.right() - 16.0);
-
-        // Right: the frame rate as a figure, set like the page's stats; a dash when none was measured.
-        let fps = match p.fps {
-            Some(f) if f >= 0.5 => Some((format!("{f:.0}"), theme::mix(theme::WHITE, theme::PINK, sel))),
-            Some(_) => Some(("—".to_string(), theme::FAINT)),
-            None => None,
-        };
-        let fps_w = fps.as_ref().map_or(0.0, |(text, color)| {
-            let num = painter.layout_no_wrap(text.clone(), theme::display(24.0), *color);
-            let unit = painter.layout_no_wrap("FPS".into(), theme::deco(9.0), theme::FAINT);
-            let w = num.size().x.max(unit.size().x);
-            let cx = right - w / 2.0;
-            painter.galley(egui::pos2(cx - num.size().x / 2.0, rect.top() + 9.0), num, *color);
-            painter.galley(egui::pos2(cx - unit.size().x / 2.0, rect.top() + 39.0), unit, theme::FAINT);
-            w + 14.0
-        });
-
-        // Left: the name, with a tick when PortWatch verified it.
-        let tick_w = if p.verified && theme::has_icons() { 18.0 } else { 0.0 };
-        let state = self.state_of(&p.repo);
-        let pending = state.as_ref().filter(|state| state.installed)
-            .and_then(|state| state.activity.as_ref())
-            .and_then(|activity| activity.pending_label());
-        let dot_w = if pending.is_some() { 14.0 } else { 0.0 };
-        let alias = self.screenshot_alias(&p.repo);
-        let (display_name, display_repo) = alias.as_ref().map_or((p.name.as_str(), p.repo.as_str()), |(name, repo)| (name.as_str(), repo.as_str()));
-        let name = theme::one_line(ui, display_name, theme::strong(14.5), theme::WHITE, right - left - fps_w - tick_w - dot_w);
-        let name_size = name.size();
-        let y1 = rect.top() + 10.0;
-        painter.galley(egui::pos2(left, y1), name, theme::WHITE);
-        if tick_w > 0.0 {
-            let at = egui::pos2(left + name_size.x + 6.0, y1 + name_size.y / 2.0 + 1.0);
-            let tick = painter.text(at, egui::Align2::LEFT_CENTER, glyph::CHECK, theme::glyphs(11.0), theme::GOOD);
-            ui.interact(tick.expand(4.0), resp.id.with("tick"), Sense::hover()).on_hover_text("Verified by PortWatch");
-        }
-        if pending.is_some() {
-            let at = egui::pos2(left + name_size.x + tick_w + 8.0, y1 + name_size.y / 2.0 + 1.0);
-            let color = if state.as_ref().and_then(|state| state.activity.as_ref()).is_some_and(|activity| activity.new_install) {
-                theme::GOOD
-            } else {
-                theme::PINK
-            };
-            painter.circle_filled(at, 3.0, color);
-        }
-
-        // Under it, one line: where it stands when that matters, else its repo.
-        let y2 = rect.top() + 34.0;
-        match self.row_status(p) {
-            Some((status, color)) => {
-                let g = painter.layout_job(egui::text::LayoutJob::single_section(
-                    status.to_uppercase(),
-                    egui::TextFormat { font_id: theme::deco(10.0), color, extra_letter_spacing: 1.4, ..Default::default() },
-                ));
-                painter.galley(egui::pos2(left, y2 + 2.0), g, color);
-            }
-            None => {
-                let repo = theme::one_line(ui, display_repo, theme::regular(12.0), theme::FAINT, right - left - fps_w);
-                painter.galley(egui::pos2(left, y2), repo, theme::FAINT);
-            }
-        }
-        let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-        if let Some(label) = pending { resp.on_hover_text(label) } else { resp }
-    }
 
     /// Where a project stands, when that is more than "listed".
     fn row_status(&self, p: &Project) -> Option<(String, Color32)> {
         if let Some(job) = self.project_jobs.get(&p.repo) {
             let j = job.lock().unwrap();
             if j.running {
-                return Some((short_stage(&j.stage).to_string(), theme::PINK));
+                return Some((short_stage(&j.stage).to_string(), theme::pink()));
             }
         }
         if self.update_for(p).is_some() {
-            return Some(("Update ready".into(), theme::WARN));
+            return Some(("Update ready".into(), theme::warn()));
         }
         if self.state_of(&p.repo).is_some_and(|state| state.installed) {
-            return Some(("Installed".into(), theme::GOOD));
+            return Some(("Installed".into(), theme::good()));
         }
         None
     }
@@ -612,89 +279,29 @@ impl App {
         if enter < 1.0 {
             ctx.request_repaint();
         }
-        let playing = self.project_jobs.0.values().any(|job| {
-            let j = job.lock().unwrap();
-            j.running && j.stage == "Playing"
-        });
-        theme::ground(ui.painter(), ui.max_rect());
-        egui::ScrollArea::vertical().id_salt("page").auto_shrink([false; 2]).show(ui, |ui| {
-            let pictures = self.screenshot_projects.is_none() && self.slides.ready(ctx);
-            if pictures {
-                let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), 200.0), Sense::hover());
-                self.slides.paint_in(ui.painter(), rect, now as f32, theme::BG);
-                // Still while a game runs: the graphics card is the game's.
-                if !playing {
-                    ctx.request_repaint_after(Duration::from_millis(40));
-                }
-            }
-            let top = if pictures { 0.0 } else { 40.0 };
-            Frame::none().inner_margin(Margin { left: 44.0, right: 44.0, top, bottom: 44.0 }).show(ui, |ui| {
-                ui.set_opacity(enter);
-                ui.add_space(10.0 * (1.0 - enter));
-                project_columns(ui, |ui, column| {
-                    if column == ProjectColumn::System {
-                        self.hardware.show(ui);
-                    } else {
-                        self.page_header(ui, ctx, &p);
-                        self.profile_tabs(ui, ctx, &p);
-                        ui.add_space(36.0);
-                        if self.screenshot_projects.is_none() { self.activity(ui, &p.repo); }
-                    }
-                });
+        egui::ScrollArea::vertical().id_salt(("profile", &p.repo)).auto_shrink([false; 2]).show(ui, |ui| {
+            ui.set_opacity(enter);
+            let background = ui.painter().add(egui::Shape::Noop);
+            let header = Frame::none().inner_margin(20.0).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                self.page_header(ui, ctx, &p);
+                self.update_offer(ui, ctx, &p);
             });
+            // The tabs share the header's surface, so omit the normal gap between widgets.
+            ui.add_space(-ui.spacing().item_spacing.y);
+            let nav = Frame::none().inner_margin(Margin::symmetric(9.0, 4.0))
+                .show(ui, |ui| self.profile_tabs(ui, ctx, &p));
+            ui.painter().set(background, theme::profile_glass(header.response.rect, nav.response.rect));
+            ui.add_space(10.0);
+            self.profile_tab_content(ui, ctx, &p, nav.inner);
         });
     }
 
     /// Where it comes from, its name, the main action and the repo link buttons.
     fn page_header(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Project) {
-        let (eyebrow, eyebrow_color) = if p.archive_exe.is_some() {
-            ("Imported ZIP", theme::LILAC)
-        } else if p.custom {
-            ("Added by link", theme::WARN)
-        } else if p.verified {
-            ("Verified by PortWatch", theme::LILAC)
-        } else {
-            ("From PortWatch", theme::LILAC)
-        };
-        let folder_error = ui.make_persistent_id(("open-profile-folder", &p.repo));
-        ui.horizontal(|ui| {
-            theme::caps(ui, eyebrow, 11.5, eyebrow_color);
-            if self.screenshot_projects.is_none() {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let folder = p.local_exe.as_deref()
-                        .and_then(|exe| std::path::Path::new(exe).parent())
-                        .map_or_else(|| crate::repo_dir(&p.repo), std::path::Path::to_path_buf);
-                    let available = folder.is_dir();
-                    let tooltip = if available {
-                        folder.display().to_string()
-                    } else {
-                        "Install the project to open its folder.".into()
-                    };
-                    if theme::small(ui, Look::Secondary, Some(glyph::FOLDER), "Open profile folder", available)
-                        .on_hover_text(tooltip)
-                        .clicked()
-                    {
-                        let error = std::process::Command::new("explorer").arg(&folder).spawn().err();
-                        ctx.data_mut(|data| data.insert_temp(folder_error, error.map(|error| error.to_string())));
-                    }
-                });
-            }
-        });
-        if self.screenshot_projects.is_none() {
-            if let Some(error) = ctx.data(|data| data.get_temp::<Option<String>>(folder_error)).flatten() {
-                wrapped(ui, &format!("Could not open the profile folder: {error}"), theme::BAD);
-            }
-        }
-        let width = ui.available_width();
-        let alias = self.screenshot_alias(&p.repo);
-        let private = alias.is_some();
-        let (display_name, display_repo) = alias.as_ref().map_or((p.name.as_str(), p.repo.as_str()), |(name, repo)| (name.as_str(), repo.as_str()));
-        theme::title(ui, display_name, 72.0, width);
-        if p.archive_exe.is_none() {
-            let display_repo = if display_repo.contains("://") { display_repo.to_owned() } else { format!("github.com/{display_repo}") };
-            ui.add(Label::new(RichText::new(display_repo).font(theme::regular(13.5)).color(theme::MUTED)).truncate());
-        }
-        ui.add_space(20.0);
+        let private = self.screenshot_projects.is_some();
+        let name=self.display_name(p);
+        let source=if p.archive_exe.is_some(){"ZIP build"}else if p.local_exe.is_some(){"Local program"}else if p.verified{"Verified by PortWatch"}else{"Git repository"};
 
         let st = match self.state_of(&p.repo) {
             Some(st) => st,
@@ -710,12 +317,8 @@ impl App {
         ));
         let blocker = self.blocking_job(&p.repo, !installed);
         let running = blocker.is_some();
-        let (job_repo, stage) = blocker.map(|job| {
-            let j = job.lock().unwrap();
-            (j.repo.clone(), j.stage.clone())
-        }).unwrap_or_default();
+        let stage=blocker.map(|job|job.lock().unwrap().stage.clone()).unwrap_or_default();
         let this_job = self.project_jobs.get(&p.repo).is_some_and(|j| j.lock().unwrap().running);
-        let install_blocked = self.blocking_job(&p.repo, true).is_some();
         let rust = installed.then(|| rust_install(&p.repo)).flatten();
         let victory = !p.runs_standalone();
         let runnable = !victory && (p.archive_exe.is_some() || rust.is_some_and(|install| install.executable.is_some()));
@@ -725,165 +328,133 @@ impl App {
         let browser_link = url.starts_with("https://") || url.starts_with("http://");
         let now = ctx.input(|i| i.time);
 
-        const GRAPHICS_GAP: f32 = 26.0;
-        const ACTION_BUTTON_HEIGHT: f32 = 46.0;
-        let graphics_below = ui.available_width() < 800.0;
-        let actions = |app: &mut Self, ui: &mut Ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            let (icon, label) = if this_job {
-                (None, short_stage(&stage))
-            } else if installed {
-                if victory || runnable { (Some(glyph::PLAY), "Play") } else { (Some(glyph::CHECK), "Built") }
-            } else {
-                (Some(glyph::DOWNLOAD), "Install project")
-            };
-            let enabled = !running && if installed { runnable || (victory && app.files_ok()) } else { p.is_git() && tools_ok };
-            if theme::button_ex(ui, Look::Primary, Size::Large, icon, label, enabled, this_job).clicked() {
-                if installed {
-                    app.play_preset_picker = (!private).then(|| {
-                        let launch = app.saved.project_launch.get(&project_key(&p.repo));
-                        PlayPresetPicker::for_project(p, &app.saved.launch_presets, launch)
-                    }).flatten();
-                    if app.play_preset_picker.is_none() {
-                        app.continue_play(ctx, p.clone());
+        let width = ui.available_width();
+        let heading = if width < 695.0 { 30.0 } else { 46.0 };
+        let controls_width = 314.0_f32.min(width);
+        let title_width = (width - controls_width - ui.spacing().item_spacing.x).max(0.0);
+        ui.horizontal_top(|ui| {
+            ui.allocate_ui_with_layout(vec2(title_width, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(title_width);
+                theme::caps(ui,source,10.5,theme::muted());
+                theme::title(ui,&name,heading,ui.available_width());
+                ui.horizontal_wrapped(|ui|{
+                    let (label,color)=self.project_status(p);
+                    theme::dot(ui,color);note(ui,if installed&&label=="Available"{"Installed"}else{&label});
+                    if let Some(a)=&st.activity{
+                        let update=if a.new_install{a.updated_ago().replacen("Updated","Installed",1)}else{a.updated_ago()};
+                        ui.label(RichText::new(update).small().color(theme::muted()));
+                        if let Some(when)=a.last_run.and_then(crate::build_activity::local_time){ui.label(RichText::new(format!("Last run {when}")).small().color(theme::muted()));}
                     }
-                } else {
-                    app.start(ctx, p.clone(), Kind::Install);
-                }
-            }
-            if browser_link && theme::button_ex(ui, Look::Secondary, Size::Large, Some(glyph::OPEN), "Open repository", !private, false)
-                .on_hover_text(if private { "Repo link hidden" } else { &url })
-                .clicked()
-            {
-                ctx.open_url(egui::OpenUrl::new_tab(&url));
-            }
-            // The copy button shows a tick for a moment after it copied.
-            let copied = now - app.copied_at < 1.6;
-            if copied {
-                ctx.request_repaint_after(Duration::from_millis(100));
-            }
-            let (icon, tip) = if copied { (glyph::CHECK, "Link copied") } else { (glyph::COPY, "Copy link") };
-            if p.is_git() && ui.add_enabled_ui(!private, |ui| theme::icon_button(ui, Look::Secondary, Size::Large, icon, tip)).inner.clicked() {
-                ctx.copy_text(url.clone());
-                app.copied_at = now;
-            }
-        };
-        if !victory {
-            ui.horizontal_wrapped(|ui| actions(self, ui));
-        } else if graphics_below {
-            ui.horizontal_wrapped(|ui| actions(self, ui));
-            ui.add_space(14.0);
-            ui.push_id(&p.repo, |ui| self.project_graphics_menu(ui, &p.repo));
-        } else {
-            let width = ui.available_width();
-            ui.allocate_ui_with_layout(vec2(width, ACTION_BUTTON_HEIGHT), Layout::left_to_right(Align::Min), |ui| {
-                ui.vertical(|ui| {
-                    let offset = GRAPHICS_BAND_HEIGHT + ui.spacing().item_spacing.y
-                        + (theme::CONTROL_H - ACTION_BUTTON_HEIGHT) / 2.0;
-                    ui.add_space(offset);
-                    ui.horizontal(|ui| actions(self, ui));
                 });
-                ui.add_space(GRAPHICS_GAP);
-                ui.push_id(&p.repo, |ui| self.project_graphics_menu(ui, &p.repo));
             });
-        }
-
-        ui.add_space(8.0);
-        if installed {
-            if let Some(activity) = &st.activity {
-                ui.horizontal_wrapped(|ui| {
-                    let updated = if activity.new_install {
-                        activity.updated_ago().replacen("Updated", "Installed", 1)
-                    } else {
-                        activity.updated_ago()
-                    };
-                    note(ui, &updated);
-                    if activity.pending_label().is_some() {
-                        note(ui, "· Not run yet");
+            ui.allocate_ui_with_layout(vec2(controls_width, 0.0), Layout::top_down(Align::Min), |ui| {
+                ui.set_width(controls_width);
+                ui.allocate_ui_with_layout(vec2(controls_width, 0.0), Layout::right_to_left(Align::Center).with_main_wrap(true), |ui| {
+                    let label=if this_job{short_stage(&stage)}else if installed{if victory||runnable{"Play project"}else{"Built"}}else{"Install project"};
+                    let enabled=!running && if installed{runnable||(victory&&self.files_ok())}else{p.is_git()&&tools_ok};
+                    if theme::button_ex(ui,Look::Primary,Size::Normal,Some(if installed{glyph::PLAY}else{glyph::DOWNLOAD}),label,enabled,this_job).clicked(){
+                        if installed{self.request_play(ctx,p);}else{self.start(ctx,p.clone(),Kind::Install);}
                     }
-                    #[cfg(windows)]
-                    if let Some(last_run) = activity.last_run.and_then(crate::build_activity::local_time) {
-                        note(ui, &format!("· Last run {last_run}"));
+                    if p.is_git()&&installed{
+                        let (label,look)=project_check_button(ctx,st.feedback,self.update_for(p).is_some(),now);
+                        let look = if look == Look::Ghost { Look::Secondary } else { look };
+                        if theme::button_ex(ui,look,Size::Normal,Some(glyph::SYNC),label,st.checking.is_none()&&!this_job,false).clicked(){self.check_repo(ctx,p,true);}
                     }
                 });
-            }
-        }
-        let other = job_repo.as_ref().and_then(|r| self.all_projects().into_iter().find(|q| &q.repo == r)).map(|q| q.name);
-        ui.horizontal_wrapped(|ui| {
-            if this_job {
-                note(ui, if private { short_stage(&stage) } else { &stage });
-            } else if running && stage == "Playing" {
-                note(ui, "Close the running game first.");
-            } else if running {
-                note(ui, &format!("Waiting for {} to finish.", if private { "the current job" } else { other.as_deref().unwrap_or("the current job") }));
-            } else if installed && !victory {
-                note(ui, if runnable { "Starts the installed Rust program." } else { "This Rust workspace has no runnable binary." });
-            } else if installed && self.files_ok() && self.saved.warm_before_play {
-                note(ui, "Warms up the shaders first, then starts your installed build with your own game files.");
-            } else if installed && self.files_ok() {
-                note(ui, "Starts your installed build with your own game files.");
-            } else if installed {
-                note(ui, "Choose the folder with your game files to play.");
-                if theme::small(ui, Look::Ghost, Some(glyph::FOLDER), "Choose folder", true).clicked() {
-                    self.pick_game_folder();
-                }
-            } else if tools.is_none() {
-                note(ui, "Checking for Git, Rust and the C++ build tools.");
-            } else if tools_ok {
-                note(ui, "Downloads and builds it on this PC once. The first build takes several minutes.");
-            } else {
-                let missing = tools.as_ref().map(|t| t.missing().join(", ")).unwrap_or_default();
-                note(ui, &format!("Installing needs {missing}."));
-                if theme::small(ui, Look::Ghost, Some(glyph::DOWNLOAD), "Install tools", true).clicked() {
-                    self.start_tools(ctx);
-                }
-            }
-        });
-
-        if installed {
-            ui.add_space(14.0);
-            ui.horizontal_wrapped(|ui| {
-                if st.checking.is_some() {
-                    ui.add(egui::Spinner::new().size(12.0).color(theme::FAINT));
-                    note(ui, "Checking for updates");
-                } else {
-                    theme::dot(ui, theme::GOOD);
-                    let v = st.built.as_deref().map(|c| &c[..c.len().min(7)]).unwrap_or("unknown");
-                let label = if private || p.archive_exe.is_some() { "Installed".into() } else { format!("Installed, version {v}") };
-                    ui.label(RichText::new(label).font(theme::regular(13.0)).color(theme::MUTED));
-                }
-                if p.local_exe.is_none() {
-                    ui.add_space(6.0);
-                    if p.is_git() {
-                        let (label, look) = project_check_button(ctx, st.feedback, self.update_for(p).is_some(), now);
-                        if theme::small(ui, look, Some(glyph::SYNC), label, st.checking.is_none() && !this_job).clicked() {
-                            self.check_repo(ctx, p, true);
+                if !private {
+                    ui.allocate_ui_with_layout(vec2(controls_width, 28.0), Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        let folder = p.local_exe.as_deref().and_then(|e| std::path::Path::new(e).parent())
+                            .map_or_else(|| crate::repo_dir(&p.repo), std::path::Path::to_path_buf);
+                        let folder_button = theme::button_ex(ui, Look::Ghost, Size::Small, Some(glyph::FOLDER),
+                            if theme::has_icons() { "" } else { "Folder" }, folder.is_dir(), false);
+                        if folder_button.on_hover_text(format!("Open project folder\n{}", folder.display())).clicked() {
+                            if let Err(e) = std::process::Command::new("explorer").arg(&folder).spawn() {
+                                self.log_export_status = Some((e.to_string(), true));
+                            }
                         }
-                    }
-                    if victory && theme::small(ui, Look::Ghost, Some(glyph::WARM), "Warm up shaders", !running && self.files_ok())
-                        .on_hover_text("Translate the game's shaders into this project's cache now, so it does not stop to translate them while you play.").clicked() {
-                        self.start(ctx, p.clone(), Kind::Warm);
-                    }
-                    if p.is_git() && theme::small(ui, Look::Ghost, Some(glyph::REPAIR), "Reinstall", !install_blocked).clicked() {
-                        self.start(ctx, p.clone(), Kind::Install);
-                    }
-                    if theme::small(ui, Look::Danger, Some(glyph::DELETE), "Uninstall", !running).clicked() {
-                        self.confirm_uninstall = Some(p.repo.clone());
-                    }
+                        if p.is_git() {
+                            if browser_link && theme::icon_button(ui, Look::Ghost, Size::Small, glyph::OPEN, "Open repository").clicked() {
+                                ctx.open_url(egui::OpenUrl::new_tab(&url));
+                            }
+                            let copy_id = ui.make_persistent_id(("copied-repo", &p.repo));
+                            let copied = ctx.data(|d| d.get_temp::<f64>(copy_id)).is_some_and(|at| now-at < 1.6);
+                            let icon = if copied { glyph::CHECK } else { glyph::COPY };
+                            if theme::icon_button(ui, Look::Ghost, Size::Small, icon, if copied { "Copied" } else { "Copy repo link" }).clicked() {
+                                ctx.copy_text(url.clone());
+                                ctx.data_mut(|d| d.insert_temp(copy_id, now));
+                                ctx.request_repaint_after(Duration::from_secs(2));
+                            }
+                            if studio::widgets::repo_link(ui, &url, browser_link).clicked() && browser_link {
+                                ctx.open_url(egui::OpenUrl::new_tab(&url));
+                            }
+                        }
+                    });
+                }
+                self.profile_stat_cards(ui, p);
+            });
+        });
+        if installed&&victory&&!self.files_ok(){if ui.button("Choose game files to play").clicked(){self.pick_game_folder();}}
+        else if !installed&&!tools_ok{self.build_tools_status(ui,ctx);}
+        else if running&&!this_job{note(ui,"Waiting for the current job to finish.");}
+        else if installed&&!victory&&!runnable{note(ui,"This Rust workspace has no runnable binary.");}
+    }
+
+    fn profile_stat_cards(&mut self, ui: &mut Ui, p: &Project) {
+        let key = project_key(&p.repo);
+        let stats = self.saved.play_stats.profile(&key, self.saved.include_exact_60_fps);
+        let avg = stats.as_ref().and_then(|s| s.average_fps);
+        let fps = avg.map_or_else(|| "—".into(), |v| format!("{v:.1} FPS"));
+        let playtime = stats.as_ref().map_or("0m", |s| s.playtime.as_str());
+        ui.add_space(3.0);
+        ui.horizontal(|ui| {
+            let gap = ui.spacing().item_spacing.x;
+            let card_width = (ui.available_width() - gap) / 2.0;
+            let card = profile_stat_card(ui, card_width, "AVERAGE FPS", &fps, true);
+            let popup = ui.make_persistent_id(("fps-options", &key));
+            if card.clicked() { ui.memory_mut(|m| m.toggle_popup(popup)); }
+            egui::popup_below_widget(ui, popup, &card, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                fps_filter(ui, &mut self.saved.include_exact_60_fps);
+                ui.separator();
+                if ui.button("Reset FPS average").clicked() {
+                    self.saved.play_stats.reset_fps(&key);
+                    ui.memory_mut(|m| m.close_popup());
                 }
             });
+            profile_stat_card(ui, card_width, "PLAYTIME", playtime, false);
+        });
+        if let Some(stats) = stats.as_ref().filter(|s| s.playing) {
+            let live = stats.latest_fps.map_or_else(|| "Waiting for FPS".into(), |f| format!("Live {f:.1} FPS"));
+            note(ui, &live);
+            ui.ctx().request_repaint_after(Duration::from_secs(1));
         }
     }
 
+    fn request_play(&mut self,ctx:&egui::Context,p:&Project){
+        self.play_preset_picker=self.screenshot_projects.is_none().then(||{
+            let launch=self.saved.project_launch.get(&project_key(&p.repo));
+            PlayPresetPicker::for_project(p,&self.saved.launch_presets,launch)
+        }).flatten();
+        if self.play_preset_picker.is_none(){self.continue_play(ctx,p.clone());}
+    }
+
+    fn build_tools_status(&mut self,ui:&mut Ui,ctx:&egui::Context){
+        ui.horizontal_wrapped(|ui|match self.tools.clone(){
+            None=>{ui.spinner();note(ui,"Checking build tools");}
+            Some(t) if t.ready()=>{theme::dot(ui,theme::good());note(ui,"Build tools ready");}
+            Some(t)=>{note(ui,&format!("Missing {}",t.missing().join(", ")));if theme::small(ui,Look::Secondary,Some(glyph::DOWNLOAD),"Install tools",!self.any_job_running()).clicked(){self.start_tools(ctx);}}
+        });
+    }
+
     /// Update, the figures from PortWatch, and what the project is.
-    fn page_body(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Project) {
+    fn update_offer(&mut self, ui: &mut Ui, ctx: &egui::Context, p: &Project) {
         let running = self.blocking_job(&p.repo, true).is_some();
         if let Some(remote) = self.update_for(p) {
-            ui.add_space(18.0);
-            theme::callout(ui, theme::WARN, glyph::SYNC, |ui| {
+            ui.add_space(8.0);
+            theme::callout(ui, theme::warn(), glyph::SYNC, |ui| {
                 let short = &remote[..remote.len().min(7)];
                 let label = if self.screenshot_projects.is_some() { "Update available.".into() } else { format!("A new version is out: {short}.") };
-                wrapped(ui, &label, theme::WHITE);
+                wrapped(ui, &label, theme::white());
                 ui.horizontal(|ui| {
                     if theme::small(ui, Look::Secondary, Some(glyph::DOWNLOAD), "Update now", !running).clicked() {
                         self.start(ctx, p.clone(), Kind::Install);
@@ -896,17 +467,26 @@ impl App {
             });
         }
 
-        if p.archive_exe.is_some() {
-            return;
-        }
+    }
+
+    fn installation(&mut self,ui:&mut Ui,ctx:&egui::Context,p:&Project){
+        let installed=self.state_of(&p.repo).is_some_and(|s|s.installed);
+        let running=self.blocking_job(&p.repo,false).is_some();
+        let install_blocked=self.blocking_job(&p.repo,true).is_some();
+        if installed && p.local_exe.is_none(){ui.horizontal_wrapped(|ui|{
+            if !p.runs_standalone() && theme::small(ui,Look::Ghost,Some(glyph::WARM),"Warm up shaders",!running&&self.files_ok()).clicked(){self.start(ctx,p.clone(),Kind::Warm);}
+            if p.is_git() && theme::small(ui,Look::Secondary,Some(glyph::REPAIR),"Reinstall",!install_blocked).clicked(){self.start(ctx,p.clone(),Kind::Install);}
+            if theme::small(ui,Look::Danger,Some(glyph::DELETE),"Uninstall",!running).clicked(){self.confirm_uninstall=Some(p.repo.clone());}
+        });}
+        if p.archive_exe.is_some(){return;}
         if p.custom {
             ui.add_space(18.0);
             let mut remove = false;
-            theme::callout(ui, theme::WARN, glyph::WARNING, |ui| {
+            theme::callout(ui, theme::warn(), glyph::WARNING, |ui| {
                 wrapped(
                     ui,
-                    "You added this repo by link. Mandyhub downloads, builds and runs its code on your PC, so keep only repos from people you trust.",
-                    theme::BLUSH,
+                    "You added this repo by link. PalmVI downloads, builds and runs its code on your PC, so keep only repos from people you trust.",
+                    theme::blush(),
                 );
                 if theme::small(ui, Look::Danger, Some(glyph::DELETE), "Remove from list", true).clicked() {
                     remove = true;
@@ -914,6 +494,8 @@ impl App {
             });
             if remove {
                 self.saved.custom.retain(|q| q.repo != p.repo);
+                self.saved.pinned.retain(|r|r!=&p.repo);
+                self.view=View::Library;
                 self.saved.selected = None;
                 return;
             }
@@ -935,25 +517,25 @@ impl App {
                 Stat {
                     label: "Frame rate",
                     value: p.fps.map_or("Not reported".into(), |f| format!("{f:.0} fps")),
-                    color: theme::WHITE,
+                    color: theme::white(),
                     tip: Some("The average in game on the author's PC."),
                 },
                 Stat {
                     label: "Rendering",
                     value: p.render.map_or("Not reported".into(), |r| format!("{:.0}%", r * 100.0)),
-                    color: theme::WHITE,
+                    color: theme::white(),
                     tip: None,
                 },
                 Stat {
                     label: "Made for",
                     value: if gpu.is_empty() { "Not stated".into() } else { gpu },
-                    color: theme::WHITE,
+                    color: theme::white(),
                     tip: None,
                 },
                 Stat {
                     label: "PortWatch",
                     value: if p.verified { "Verified" } else { "Not verified" }.into(),
-                    color: if p.verified { theme::GOOD } else { theme::MUTED },
+                    color: if p.verified { theme::good() } else { theme::muted() },
                     tip: None,
                 },
             ],
@@ -961,43 +543,44 @@ impl App {
         if !p.gpu.is_empty() && p.gpu.iter().all(|g| !g.eq_ignore_ascii_case("nvidia")) {
             ui.add_space(12.0);
             ui.horizontal(|ui| {
-                theme::icon(ui, glyph::WARNING, 13.0, theme::WARN);
-                ui.label(RichText::new("Made for AMD cards: it may not start on NVIDIA.").font(theme::regular(13.0)).color(theme::MUTED));
+                theme::icon(ui, glyph::WARNING, 13.0, theme::warn());
+                ui.label(RichText::new("Made for AMD cards: it may not start on NVIDIA.").font(theme::regular(13.0)).color(theme::muted()));
             });
         }
         if !p.summary.trim().is_empty() {
             ui.add_space(32.0);
-            theme::caps(ui, "About", 11.5, theme::LILAC);
+            theme::caps(ui, "About", 11.5, theme::lilac());
             ui.add_space(2.0);
             // Lines of a readable length, whatever the window's width.
             ui.scope(|ui| {
                 ui.set_max_width(680.0);
                 let summary = if self.screenshot_projects.is_some() { "Project description hidden." } else { &p.summary };
-                ui.add(Label::new(RichText::new(summary).font(theme::regular(15.0)).color(theme::BLUSH)).wrap());
+                ui.add(Label::new(RichText::new(summary).font(theme::regular(15.0)).color(theme::blush())).wrap());
             });
         }
     }
 
-    fn profile_tabs(&mut self, ui: &mut Ui, ctx: &egui::Context, project: &Project) {
-        ui.add_space(20.0);
-        let tab_key = profile_tab_key(&project.repo);
-        let id = egui::Id::new(&tab_key);
-        let mut tab = ctx.data(|data| data.get_temp::<usize>(id)).unwrap_or_default();
-        if let Some(selected) = theme::segmented(ui, &tab_key, &["Overview", "Profile notes", "Launch settings"], Some(tab), None) {
-            tab = selected;
-            ctx.data_mut(|data| data.insert_temp(id, selected));
-        }
+    fn profile_tabs(&mut self, ui: &mut Ui, ctx: &egui::Context, project: &Project) -> usize {
+        let id=egui::Id::new(profile_tab_key(&project.repo));
+        let mut tab=ctx.data(|d|d.get_temp::<usize>(id)).unwrap_or(0);
+        let tabs=["Overview","Graphics","Launch settings","Live logs","Notes","Installation"].iter().enumerate()
+            .filter(|(i,_)|*i!=1||!project.runs_standalone()).map(|(i,s)|(i,s.to_string())).collect::<Vec<_>>();
+        if let Some(next)=studio::widgets::tab_row(ui,&tabs,tab){tab=next;self.switch_tab(ctx,&project.repo,tab);}
+        tab
+    }
+
+    fn profile_tab_content(&mut self, ui: &mut Ui, ctx: &egui::Context, project: &Project, tab: usize) {
         match tab {
-            1 | 2 if self.screenshot_projects.is_some() => note(ui, "Hidden in Screenshot mode."),
-            1 => {
-                ui.add_space(12.0);
-                self.project_notes(ui, project);
+            1|2|3|4 if self.screenshot_projects.is_some()=>note(ui,"Hidden in sharing mode."),
+            1=>theme::card(ui,18.0,|ui|self.project_graphics_menu(ui,&project.repo)),
+            2=>self.project_launch_card(ui,project),
+            3=>theme::card(ui,18.0,|ui|self.activity(ui,&project.repo)),
+            4=>self.project_notes(ui,project),
+            5=>theme::card(ui,18.0,|ui|self.installation(ui,ctx,project)),
+            _=>{
+                self.quick_cards(ui,project);
+                if self.screenshot_projects.is_none(){ui.add_space(8.0);theme::card(ui,16.0,|ui|self.activity(ui,&project.repo));}
             }
-            2 => {
-                ui.add_space(12.0);
-                self.project_launch_card(ui, project);
-            }
-            _ => self.page_body(ui, ctx, project),
         }
         let key = project_key(&project.repo);
         if self.saved.project_launch.get(&key).is_some_and(|launch| {
@@ -1012,60 +595,13 @@ impl App {
         let default_graphics = self.saved.default_graphics();
         let key = project_key(repo);
         let launch = self.saved.project_launch.entry(key).or_default();
-        ui.vertical_centered(|ui| {
-            ui.set_width(PROJECT_GRAPHICS_WIDTH);
-            // Equal space above and below the presets keeps their center aligned
-            // with the neighboring Play button.
-            let band_layout = Layout::top_down(Align::Center).with_main_align(Align::Center);
-            ui.allocate_ui_with_layout(vec2(PROJECT_GRAPHICS_WIDTH, GRAPHICS_BAND_HEIGHT), band_layout, |ui| {
-                ui.set_min_height(GRAPHICS_BAND_HEIGHT);
-                ui.spacing_mut().item_spacing.y = 2.0;
-                theme::caps(ui, "Project graphics", 10.5, theme::LILAC);
-                note(ui, if launch.graphics.is_some() { "Overrides global" } else { "Using global" });
-            });
-            let mut graphics = launch.graphics.unwrap_or(default_graphics);
-            let names = MODES.map(|mode| mode.0);
-            if let Some(index) = theme::segmented(ui, "project-graphics-preset", &names, graphics_mode(graphics), None) {
-                graphics.series_s = MODES[index].1;
-                graphics.render_scale = MODES[index].2;
-                launch.graphics = Some(graphics);
-            }
-            ui.allocate_ui_with_layout(vec2(PROJECT_GRAPHICS_WIDTH, GRAPHICS_BAND_HEIGHT), band_layout, |ui| {
-                ui.set_min_height(GRAPHICS_BAND_HEIGHT);
-                let label = if graphics.output == OutputResolution::Default {
-                    "Other graphics settings".into()
-                } else {
-                    format!("Other graphics settings · {}", graphics.output.label())
-                };
-                ui.menu_button(label, |ui| {
-                    ui.set_width(340.0);
-                    let before = graphics;
-                    egui::ComboBox::from_label("Console profile")
-                        .selected_text(if graphics.series_s { "Series S" } else { "Series X" })
-                        .show_ui(ui, |ui| {
-                            ui.selectable_value(&mut graphics.series_s, false, "Series X");
-                            ui.selectable_value(&mut graphics.series_s, true, "Series S");
-                        });
-                    egui::ComboBox::from_label("Output resolution")
-                        .selected_text(graphics.output.label())
-                        .show_ui(ui, |ui| {
-                            for output in OutputResolution::OPTIONS {
-                                ui.selectable_value(&mut graphics.output, output, output.label());
-                            }
-                        });
-                    note(ui, "Output resolution requires support in the selected build.");
-                    ui.add_space(8.0);
-                    graphics_options(ui, &mut graphics);
-                    if graphics != before {
-                        launch.graphics = Some(graphics);
-                    }
-                    if launch.graphics.is_some() && ui.button("Use global settings").clicked() {
-                        launch.graphics = None;
-                        ui.close_menu();
-                    }
-                });
-            });
-        });
+        ui.heading("Graphics preset");
+        note(ui,if launch.graphics.is_some(){"Overrides global settings"}else{"Using global settings"});
+        let mut graphics=launch.graphics.unwrap_or(default_graphics);
+        let before=graphics;
+        graphics_controls(ui,&mut graphics);
+        if before!=graphics{launch.graphics=Some(graphics);}
+        if launch.graphics.is_some() && ui.button("Use global settings").clicked(){launch.graphics=None;}
     }
 
     fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {
@@ -1102,7 +638,8 @@ impl App {
             (j.running, j.failed, j.stage.clone(), !j.log.is_empty(), j.running && j.stoppable, j.warm_status.clone())
         };
         ui.allocate_ui_with_layout(vec2(ui.available_width(), 28.0), Layout::left_to_right(Align::Center), |ui| {
-            theme::caps(ui, "Activity", 11.5, theme::LILAC);
+            let (r,_)=ui.allocate_exact_size(vec2(18.0,18.0),Sense::hover());studio::widgets::pulse(ui.painter(),r.center(),theme::lilac());
+            ui.label(RichText::new("Live logs").font(theme::strong(18.0)).color(theme::white()));
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if has_log {
                     let label = if self.show_log { "Hide log" } else { "Show log" };
@@ -1117,24 +654,30 @@ impl App {
         });
         ui.horizontal(|ui| {
             if running && stage != "Playing" {
-                ui.add(egui::Spinner::new().size(12.0).color(theme::PINK));
+                ui.add(egui::Spinner::new().size(12.0).color(theme::pink()));
             } else {
-                theme::dot(ui, if failed { theme::BAD } else if stage.is_empty() { theme::LINE_STRONG } else { theme::GOOD });
+                theme::dot(ui, if failed { theme::bad() } else if stage.is_empty() { theme::line_strong() } else { theme::good() });
             }
             let (text, color) = if stage.is_empty() {
-                ("Nothing running".to_string(), theme::FAINT)
+                ("Nothing running".to_string(), theme::faint())
             } else if failed {
-                (stage, theme::BAD)
+                (stage, theme::bad())
             } else if running {
-                (stage, theme::WHITE)
+                (stage, theme::white())
             } else {
-                (stage, theme::MUTED)
+                (stage, theme::muted())
             };
             ui.label(RichText::new(text).font(theme::regular(13.5)).color(color));
             if let Some(status) = warm_status {
                 note(ui, &status);
             }
         });
+        if !has_log || !self.show_log {
+            theme::glass_frame(ui, 7.0, 14.0, theme::bg(), |ui|{
+                ui.set_min_size(vec2(ui.available_width(),if self.log_expanded{(ui.ctx().screen_rect().height()-370.0).max(280.0)}else{118.0}));
+                ui.label(RichText::new(if has_log{"Log hidden"}else{"Output will appear here when the project runs."}).font(theme::mono(12.0)).color(theme::muted()));
+            });
+        }
         if has_log && self.show_log {
             ui.add_space(6.0);
             let log = job.lock().unwrap().log.preview();
@@ -1159,19 +702,15 @@ impl App {
                 }
             });
             if let Some((message, error)) = &self.log_export_status {
-                wrapped(ui, message, if *error { theme::BAD } else { theme::MUTED });
+                wrapped(ui, message, if *error { theme::bad() } else { theme::muted() });
             }
             let height = if self.log_expanded { (ui.ctx().screen_rect().height() - 190.0).max(320.0) } else { 240.0 };
-            Frame::none()
-                .fill(theme::DEEP)
-                .stroke(Stroke::new(1.0, theme::LINE))
-                .rounding(theme::R)
-                .inner_margin(Margin::same(14.0))
-                .show(ui, |ui| {
+            theme::glass_frame(ui, theme::R, 14.0, theme::deep(), |ui| {
                     ui.set_width(ui.available_width());
                     egui::ScrollArea::vertical().id_salt("log").max_height(height).stick_to_bottom(true).auto_shrink([false, true]).show(
                         ui,
                         |ui| {
+                            ui.set_min_height(height.min(ui.ctx().screen_rect().height()*0.55));
                             let mut text = log.as_str();
                             ui.add(egui::TextEdit::multiline(&mut text)
                                 .id_salt("activity-log-text")
@@ -1183,38 +722,11 @@ impl App {
                     );
                 });
         }
+        if self.view!=View::Activity && ui.button("Previous session logs").clicked(){self.view=View::Activity;}
     }
 
     fn settings_page(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        theme::ground(ui.painter(), ui.max_rect());
-        egui::ScrollArea::vertical().id_salt("settings").auto_shrink([false; 2]).show(ui, |ui| {
-            let avail = ui.available_width();
-            let col = (avail - 64.0).min(720.0);
-            let side = ((avail - col) / 2.0).max(32.0);
-            Frame::none().inner_margin(Margin { left: side, right: side, top: 40.0, bottom: 48.0 }).show(ui, |ui| {
-                ui.set_width(col);
-                theme::caps(ui, "Mandyhub", 11.5, theme::LILAC);
-                theme::title(ui, "Settings", 64.0, col);
-                ui.add_space(18.0);
-                if self.screenshot_projects.is_some() {
-                    note(ui, "Settings are hidden in Screenshot mode.");
-                    return;
-                }
-                self.game_files_card(ui, ctx);
-                ui.add_space(16.0);
-                self.graphics_card(ui);
-                ui.add_space(16.0);
-                self.launch_card(ui);
-                ui.add_space(16.0);
-                self.install_folder_card(ui);
-                ui.add_space(16.0);
-                self.pictures_card(ui);
-                ui.add_space(16.0);
-                self.switches_card(ui);
-                ui.add_space(16.0);
-                self.about_card(ui, ctx);
-            });
-        });
+        self.settings_workspace(ui,ctx);
     }
 
     fn game_files_card(&mut self, ui: &mut Ui, ctx: &egui::Context) {
@@ -1223,7 +735,7 @@ impl App {
             ui,
             "Game files",
             None,
-            "The folder with game_scarlett_master.exe from your own copy of the game. Mandyhub never downloads game files.",
+            "The folder with game_scarlett_master.exe from your own copy of the game. PalmVI never downloads game files.",
             |ui| {
                 ui.allocate_ui_with_layout(vec2(ui.available_width(), theme::CONTROL_H), Layout::right_to_left(Align::Center), |ui| {
                     let label = if searching { "Searching drives" } else { "Find game files" };
@@ -1249,7 +761,7 @@ impl App {
                 self.files_status(ui);
                 if let Some(e) = &self.find_error {
                     ui.add_space(4.0);
-                    wrapped(ui, e, theme::BAD);
+                    wrapped(ui, e, theme::bad());
                 }
             },
         );
@@ -1260,17 +772,17 @@ impl App {
             if self.saved.game_dir.trim().is_empty() {
                 note(ui, "No folder chosen yet.");
             } else if self.files_ok() {
-                theme::icon(ui, glyph::CHECK, 13.0, theme::GOOD);
-                ui.label(RichText::new("All game files are here.").font(theme::regular(13.0)).color(theme::GOOD));
+                theme::icon(ui, glyph::CHECK, 13.0, theme::good());
+                ui.label(RichText::new("All game files are here.").font(theme::regular(13.0)).color(theme::good()));
             } else if self.empty {
-                theme::icon(ui, glyph::WARNING, 13.0, theme::BAD);
-                ui.label(RichText::new("This folder is empty.").font(theme::regular(13.0)).color(theme::BAD));
+                theme::icon(ui, glyph::WARNING, 13.0, theme::bad());
+                ui.label(RichText::new("This folder is empty.").font(theme::regular(13.0)).color(theme::bad()));
             } else {
-                theme::icon(ui, glyph::WARNING, 13.0, theme::BAD);
-                ui.label(RichText::new("Missing").font(theme::regular(13.0)).color(theme::BAD));
+                theme::icon(ui, glyph::WARNING, 13.0, theme::bad());
+                ui.label(RichText::new("Missing").font(theme::regular(13.0)).color(theme::bad()));
                 for (f, ok) in &self.files {
                     if !ok {
-                        ui.label(RichText::new(*f).font(theme::mono(12.0)).color(theme::BLUSH));
+                        ui.label(RichText::new(*f).font(theme::mono(12.0)).color(theme::blush()));
                     }
                 }
             }
@@ -1291,6 +803,7 @@ impl App {
                 self.saved.fix_8gb = graphics.fix_8gb;
                 self.saved.bright_shadows = graphics.bright_shadows;
                 self.saved.fullscreen = graphics.fullscreen;
+                self.saved.output=graphics.output;
             },
         );
     }
@@ -1316,7 +829,7 @@ impl App {
                     "Slow: about 20 minutes on 16 threads, hours after a translator update. They belong to this graphics card and driver.",
                 );
                 ui.add_space(20.0);
-                ui.label(RichText::new("Default launch arguments").font(theme::strong(14.0)).color(theme::WHITE));
+                ui.label(RichText::new("Default launch arguments").font(theme::strong(14.0)).color(theme::white()));
                 note(ui, "Added to victory run, for example --strict. Arguments for the game itself go after --.");
                 ui.add_space(6.0);
                 let w = ui.available_width();
@@ -1333,7 +846,7 @@ impl App {
             None,
             "Projects are downloaded and built here. Each one takes several GB, so a big drive is best.",
             |ui| {
-                ui.add(Label::new(RichText::new(workspace().display().to_string()).font(theme::mono(12.5)).color(theme::BLUSH)).truncate());
+                ui.add(Label::new(RichText::new(workspace().display().to_string()).font(theme::mono(12.5)).color(theme::blush())).truncate());
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
                     if theme::button_ex(ui, Look::Secondary, Size::Normal, Some(glyph::FOLDER), "Change folder", !running, false).clicked() {
@@ -1356,10 +869,10 @@ impl App {
             ui,
             "Background pictures",
             None,
-            "Put .jpg or .png pictures in this folder and they show across the top of each project's page. Mandyhub reads them when it starts.",
+            "Select My slideshow to cycle through JPG and PNG files from this folder. Restart after adding pictures.",
             |ui| {
                 let dir = slides::folder();
-                ui.add(Label::new(RichText::new(dir.display().to_string()).font(theme::mono(12.5)).color(theme::BLUSH)).truncate());
+                ui.add(Label::new(RichText::new(dir.display().to_string()).font(theme::mono(12.5)).color(theme::blush())).truncate());
                 ui.add_space(10.0);
                 if theme::button(ui, Look::Secondary, Some(glyph::FOLDER), "Open the folder").clicked() {
                     let _ = std::fs::create_dir_all(&dir);
@@ -1375,8 +888,8 @@ impl App {
             ui.add(
                 egui::TextEdit::multiline(&mut self.saved.extra_env)
                     .font(theme::mono(12.5))
-                    .text_color(theme::WHITE)
-                    .hint_text(RichText::new("VICTORY_NAME=value").color(theme::FAINT))
+                    .text_color(theme::white())
+                    .hint_text(RichText::new("VICTORY_NAME=value").color(theme::faint()))
                     .desired_rows(3)
                     .desired_width(w - 28.0)
                     .margin(Margin::symmetric(14.0, 10.0)),
@@ -1390,7 +903,7 @@ impl App {
         use crate::updater::{State, RELEASES};
         let busy = self.any_job_running();
         let card_start = ui.next_widget_position();
-        section(ui, "Launcher updates", None, concat!("Mandyhub ", env!("CARGO_PKG_VERSION")), |ui| {
+        section(ui, "Launcher updates", None, concat!("PalmVI ", env!("CARGO_PKG_VERSION")), |ui| {
             match &self.updater.state {
                 State::Idle => {}
                 State::Checking => note(ui, "Checking GitHub for updates…"),
@@ -1399,9 +912,9 @@ impl App {
                 State::Downloading => note(ui, "Downloading and verifying the update…"),
                 State::Downloaded(update) => {
                     if let Some(error) = &self.updater.restart_error {
-                        wrapped(ui, error, theme::BAD);
+                        wrapped(ui, error, theme::bad());
                     } else {
-                        wrapped(ui, "Verified update ready.", theme::BLUSH);
+                        wrapped(ui, "Verified update ready.", theme::blush());
                     }
                     ui.horizontal_wrapped(|ui| {
                         if theme::button_ex(ui, Look::Primary, Size::Normal, Some(glyph::SYNC), "Restart to apply", !busy, false).clicked() {
@@ -1414,7 +927,7 @@ impl App {
                         }
                     });
                 }
-                State::Failed(error) => wrapped(ui, error, theme::BAD),
+                State::Failed(error) => wrapped(ui, error, theme::bad()),
             }
             ui.horizontal_wrapped(|ui| {
                 match self.updater.state {
@@ -1441,16 +954,17 @@ impl App {
     }
 
     fn open_launcher_updates(&mut self, ctx: &egui::Context) {
+        self.studio.settings_tab = 4;
         self.view = View::Settings;
         ctx.data_mut(|data| data.insert_temp(egui::Id::new("scroll-to-launcher-updates"), true));
     }
 
     fn credits_card(&self, ui: &mut Ui) {
-        section(ui, "About Mandyhub", None, "", |ui| {
+        section(ui, "PalmVI credits", None, "", |ui| {
             wrapped(
                 ui,
-                "Mandyhub by Zettrox. The project list comes from PortWatch. The projects are their authors' work, built on VIctory by Marvisak and its contributors.",
-                theme::BLUSH,
+                "PalmVI grew out of Mandyhub by Zettrox. The project list comes from PortWatch. The projects are their authors' work, built on VIctory by Marvisak and its contributors.",
+                theme::blush(),
             );
             ui.horizontal_wrapped(|ui| {
                 ui.hyperlink_to("ellion369", "https://github.com/ellion369");
@@ -1460,8 +974,8 @@ impl App {
                 ui.hyperlink_to("TheGameOnAddict", "https://github.com/TheGameOnAddict");
                 note(ui, "Save picker, checkpoints, project settings, notes, build tracking, and compatibility improvements");
             });
-            wrapped(ui, "No game files are included or downloaded: you need your own copy of the game.", theme::FAINT);
-            wrapped(ui, "Display type: Josefin Sans and Big Shoulders Display, under the SIL Open Font License.", theme::FAINT);
+            wrapped(ui, "No game files are included or downloaded: you need your own copy of the game.", theme::faint());
+            wrapped(ui, "Display type: Josefin Sans and Big Shoulders Display, under the SIL Open Font License.", theme::faint());
             ui.add_space(10.0);
             if theme::button(ui, Look::Secondary, Some(glyph::OPEN), "Open portwatch-vi.xyz").clicked() {
                 ui.ctx().open_url(egui::OpenUrl::new_tab("https://portwatch-vi.xyz"));
@@ -1473,9 +987,16 @@ impl App {
         if project.runs_standalone() {
             self.start(ctx, project, Kind::Play(crate::saves::LaunchSave::Continue));
         } else {
-            self.save_picker = Some(SavePicker::new(project));
+            self.prepare_save_picker(project,false);
         }
     }
+
+    fn prepare_save_picker(&mut self,project:Project,settings_only:bool){
+        let mut picker=SavePicker::new(project);
+        if let Some((_,choice))=self.saved.save_choices.get(&project_key(&picker.project.repo)){picker.select(choice);}
+        picker.settings_only=settings_only;self.save_picker=Some(picker);
+    }
+    fn open_save_settings(&mut self,project:Project){self.prepare_save_picker(project,true);}
 
     /// The open dialog, if any: add a repo, uninstall, or move the install folder.
     fn dialogs(&mut self, ctx: &egui::Context) {
@@ -1498,7 +1019,8 @@ impl App {
             let (action, dismissed) = picker.show(ctx, t0, ready, alias.as_deref());
             match action {
                 save_picker::Action::Launch(choice) if !dismissed => {
-                    self.start(ctx, picker.project, Kind::Play(choice));
+                    if self.screenshot_projects.is_none(){self.saved.save_choices.insert(project_key(&picker.project.repo),(picker.selection_name(),choice.clone()));}
+                    if !picker.settings_only{self.start(ctx, picker.project, Kind::Play(choice));}
                 }
                 save_picker::Action::Keep if !dismissed => self.save_picker = Some(picker),
                 _ => {}
@@ -1540,11 +1062,22 @@ impl App {
         if let Some(mut add) = self.add_repo.take() {
             let mut keep = true;
             let (_, dismissed) = theme::modal(ctx, "add-repo", t0, 460.0, |ui| {
-                theme::caps(ui, "Custom repo", 11.5, theme::LILAC);
-                theme::title(ui, "Import Repo/Zip", 40.0, 460.0);
+                theme::caps(ui, "Project library", 11.5, theme::lilac());
+                theme::title(ui, "Import project", 36.0, 460.0);
                 note(ui, "Add a Rust project by Git URL or import a prebuilt ZIP.");
                 ui.add_space(14.0);
                 let w = ui.available_width();
+                if let Some(tab)=studio::widgets::tabs(ui,&[(0,"Git repository".into()),(1,"Build ZIP".into())],usize::from(add.zip)){add.zip=tab==1;add.focus=!add.zip;add.error=None;}
+                if add.zip{
+                    note(ui,"Choose a ZIP containing the compiled program and its supporting files.");
+                    button_row(ui,|ui|{
+                        if theme::button_ex(ui,Look::Primary,Size::Normal,Some(glyph::FOLDER),"Choose build ZIP…",!running,false).clicked(){
+                            if let Some(path)=rfd::FileDialog::new().add_filter("Build ZIP",&["zip"]).pick_file(){self.import_build_zip(ctx,path);keep=false;}
+                        }
+                        if ui.button("Cancel").clicked(){keep=false;}
+                    });
+                    return;
+                }
                 let field = theme::field(ui, &mut add.link, "https://git.example.com/owner/project.git", w, Some(glyph::LINK));
                 if add.focus {
                     field.request_focus();
@@ -1556,14 +1089,14 @@ impl App {
                 let mut submit = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if let Some(e) = &add.error {
                     ui.add_space(2.0);
-                    wrapped(ui, e, theme::BAD);
+                    wrapped(ui, e, theme::bad());
                 }
                 ui.add_space(14.0);
-                theme::callout(ui, theme::WARN, glyph::WARNING, |ui| {
+                theme::callout(ui, theme::warn(), glyph::WARNING, |ui| {
                     wrapped(
                         ui,
-                        "Mandyhub downloads, builds and runs this repo's code on your PC. Add only repos from people you trust: fake repos with malware exist.",
-                        theme::BLUSH,
+                        "PalmVI downloads, builds and runs this repo's code on your PC. Add only repos from people you trust: fake repos with malware exist.",
+                        theme::blush(),
                     );
                 });
                 ui.add_space(20.0);
@@ -1571,12 +1104,6 @@ impl App {
                     ui.spacing_mut().item_spacing.x = 10.0;
                     if theme::button(ui, Look::Primary, Some(glyph::ADD), "Import repo link").clicked() {
                         submit = true;
-                    }
-                    if theme::small(ui, Look::Secondary, Some(glyph::FOLDER), "Import build ZIP…", !running).clicked() {
-                        if let Some(path) = rfd::FileDialog::new().add_filter("Build ZIP", &["zip"]).pick_file() {
-                            self.import_build_zip(ctx, path);
-                            keep = false;
-                        }
                     }
                     if theme::button(ui, Look::Ghost, None, "Cancel").clicked() {
                         keep = false;
@@ -1600,7 +1127,7 @@ impl App {
         if let Some(error) = import_error {
             let (close, dismissed) = theme::modal(ctx, "zip-import-error", t0, 440.0, |ui| {
                 theme::title(ui, "Build import failed", 34.0, 440.0);
-                wrapped(ui, &error, theme::BAD);
+                wrapped(ui, &error, theme::bad());
                 theme::button(ui, Look::Primary, None, "Close").clicked()
             });
             if close || dismissed {
@@ -1614,9 +1141,9 @@ impl App {
                 .unwrap_or_else(|| project.as_ref().map_or_else(|| repo.clone(), |p| p.name.clone()));
             let mut close = false;
             let (_, dismissed) = theme::modal(ctx, "uninstall", t0, 440.0, |ui| {
-                theme::caps(ui, "Uninstall", 11.5, theme::BAD);
+                theme::caps(ui, "Uninstall", 11.5, theme::bad());
                 theme::title(ui, &name, 40.0, 440.0);
-                wrapped(ui, "This deletes its download, its build and its shader cache. Your saves stay, and you can install it again later.", theme::BLUSH);
+                wrapped(ui, "This deletes its download, its build and its shader cache. Your saves stay, and you can install it again later.", theme::blush());
                 ui.add_space(20.0);
                 button_row(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
@@ -1640,12 +1167,12 @@ impl App {
             let ready = !self.any_job_running();
             let mut close = false;
             let (_, dismissed) = theme::modal(ctx, "move", t0, 520.0, |ui| {
-                theme::caps(ui, "Install folder", 11.5, theme::LILAC);
+                theme::caps(ui, "Install folder", 11.5, theme::lilac());
                 theme::title(ui, "Move installed projects?", 40.0, 520.0);
-                wrapped(ui, "Your installed projects and their saves are in the old folder. Moving them to another drive can take a while.", theme::BLUSH);
+                wrapped(ui, "Your installed projects and their saves are in the old folder. Moving them to another drive can take a while.", theme::blush());
                 ui.add_space(10.0);
-                ui.add(Label::new(RichText::new(format!("From  {}", old.display())).font(theme::mono(12.0)).color(theme::FAINT)).truncate());
-                ui.add(Label::new(RichText::new(format!("To    {}", new.display())).font(theme::mono(12.0)).color(theme::WHITE)).truncate());
+                ui.add(Label::new(RichText::new(format!("From  {}", old.display())).font(theme::mono(12.0)).color(theme::faint())).truncate());
+                ui.add(Label::new(RichText::new(format!("To    {}", new.display())).font(theme::mono(12.0)).color(theme::white())).truncate());
                 ui.add_space(20.0);
                 button_row(ui, |ui| {
                     ui.spacing_mut().item_spacing.x = 10.0;
@@ -1685,7 +1212,7 @@ impl App {
     }
 
     fn open_add_repo(&mut self) {
-        self.add_repo = Some(AddRepo { link: String::new(), error: None, focus: true });
+        self.add_repo = Some(AddRepo { zip:false, link: String::new(), error: None, focus: true });
     }
 
     /// Puts a repo added by link at the top of the list and opens its page.
@@ -1719,10 +1246,4 @@ impl App {
         }
     }
 
-    fn mode_name(&self) -> String {
-        match graphics_mode(self.saved.default_graphics()) {
-            Some(i) => MODES[i].0.to_string(),
-            None => format!("{:.0}%", self.saved.render_scale * 100.0),
-        }
-    }
 }

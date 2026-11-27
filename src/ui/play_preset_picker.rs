@@ -202,7 +202,7 @@ fn choice_card(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool) -> 
         0.0,
         egui::TextFormat {
             font_id: theme::strong(17.0),
-            color: theme::WHITE,
+            color: theme::white(),
             ..Default::default()
         },
     );
@@ -212,19 +212,19 @@ fn choice_card(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool) -> 
         0.0,
         egui::TextFormat {
             font_id: theme::regular(13.0),
-            color: theme::MUTED,
+            color: theme::muted(),
             ..Default::default()
         },
     );
     let row = egui::Button::new(text)
         .min_size(egui::vec2(ui.available_width(), 62.0))
-        .fill(if selected { theme::RAISED } else { theme::DEEP })
+        .fill(if selected { theme::raised() } else { theme::deep() })
         .stroke(egui::Stroke::new(
             1.0_f32,
             if selected {
-                theme::PINK
+                theme::pink()
             } else {
-                theme::LINE_STRONG
+                theme::line_strong()
             },
         ));
     ui.add(row).clicked()

@@ -204,7 +204,7 @@ pub struct Panel {
 }
 
 impl Panel {
-    pub fn show(&mut self, ui: &mut Ui) {
+    fn poll(&mut self, ui: &mut Ui) {
         if self.machine.is_none() && self.request.is_none() {
             let (tx, rx) = mpsc::channel();
             self.request = Some(rx);
@@ -227,16 +227,45 @@ impl Panel {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
         }
+    }
+
+    pub fn header(&mut self,ui:&mut Ui)->bool{
+        self.poll(ui);
+        let data=reference();
+        let machine=self.machine.as_ref();
+        let cpu=machine.and_then(|m|m.cpu.as_deref()).and_then(|n|rating(&data.cpus,n,None)).map(|r|r.tflops/data.ps5_cpu_tflops);
+        let gpu=machine.filter(|m|m.desktop).and_then(|m|m.gpus.get(self.selected)).and_then(|g|rating(&data.gpus,&g.name,Some((g.vram_bytes as f64/1073741824.0).round() as u64))).map(|r|r.tflops/data.ps5_gpu_tflops);
+        let (rect,response)=ui.allocate_exact_size(egui::vec2(221.0,42.0),egui::Sense::click());
+        let p=ui.painter();let left=rect.left()+8.0;
+        if response.hovered() || response.has_focus() {
+            p.rect(rect, 7.0, theme::raised(), egui::Stroke::new(1.0_f32, theme::lilac()));
+        }
+        for (i,(label,ratio,color)) in [("CPU",cpu,theme::good()),("GPU",gpu,egui::Color32::from_rgb(197,179,240))].into_iter().enumerate(){
+            let y=rect.center().y-8.0+i as f32*16.0;
+            p.text(egui::pos2(left,y),egui::Align2::LEFT_CENTER,label,theme::strong(10.5),theme::muted());
+            let bar=egui::Rect::from_min_size(egui::pos2(left+28.0,y-2.5),egui::vec2(100.0,5.0));
+            p.rect_filled(bar,2.5,theme::raised());
+            if let Some(v)=ratio{p.rect_filled(egui::Rect::from_min_size(bar.min,egui::vec2(bar.width()*(v/data.meter_limit()).clamp(0.0,1.0),5.0)),2.5,color);}
+            let x=bar.left()+bar.width()/data.meter_limit();
+            p.line_segment([egui::pos2(x,y-3.5),egui::pos2(x,y+3.5)],egui::Stroke::new(1.0_f32,theme::muted()));
+            p.text(egui::pos2(left+168.0,y),egui::Align2::RIGHT_CENTER,ratio.map_or_else(||"—".into(),|v|format!("{v:.2}×")),theme::strong(11.0),theme::white());
+        }
+        p.text(egui::pos2(left+174.0,rect.center().y),egui::Align2::LEFT_CENTER,"vs PS5",theme::regular(11.0),theme::muted());
+        response.on_hover_cursor(egui::CursorIcon::PointingHand).on_hover_text("Ticks mark PS5 compute at 1×. Click for hardware details.").clicked()
+    }
+
+    pub fn show(&mut self, ui: &mut Ui) {
+        self.poll(ui);
         theme::card(ui, 18.0, |ui| {
             theme::title(ui, "Your system", 27.0, ui.available_width());
             ui.add_space(10.0);
             let Some(machine) = &self.machine else {
                 ui.spinner();
-                text(ui, "Detecting hardware…", theme::MUTED);
+                text(ui, "Detecting hardware…", theme::muted());
                 return;
             };
             let data = reference();
-            theme::caps(ui, "Graphics", 11.0, theme::LILAC);
+            theme::caps(ui, "Graphics", 11.0, theme::lilac());
             if machine.gpus.len() > 1 {
                 egui::ComboBox::from_id_salt("comparison-adapter")
                     .width(ui.available_width())
@@ -256,7 +285,7 @@ impl Panel {
                         .gpus
                         .first()
                         .map_or("Unavailable", |g| g.name.as_str()),
-                    theme::WHITE,
+                    theme::white(),
                 );
             }
             let gpu = machine.gpus.get(self.selected);
@@ -264,15 +293,15 @@ impl Panel {
                 text(
                     ui,
                     &format!("{:.1} GiB VRAM", gpu.vram_bytes as f64 / 1073741824.0),
-                    theme::MUTED,
+                    theme::muted(),
                 );
             }
             ui.add_space(12.0);
-            theme::caps(ui, "Processor", 11.0, theme::LILAC);
+            theme::caps(ui, "Processor", 11.0, theme::lilac());
             text(
                 ui,
                 machine.cpu.as_deref().unwrap_or("Unavailable"),
-                theme::WHITE,
+                theme::white(),
             );
             text(
                 ui,
@@ -280,11 +309,11 @@ impl Panel {
                     || "System memory unavailable".into(),
                     |kib| format!("{:.1} GiB RAM", kib as f64 / 1048576.0),
                 ),
-                theme::MUTED,
+                theme::muted(),
             );
             section_break(ui);
-            theme::caps(ui, "Compute performance", 11.0, theme::PINK);
-            text(ui, "PS5 reference  ·  1×", theme::MUTED);
+            theme::caps(ui, "Compute performance", 11.0, theme::pink());
+            text(ui, "PS5 reference  ·  1×", theme::muted());
             ui.add_space(6.0);
             let graphics = gpu.filter(|_| machine.desktop).and_then(|g| {
                 rating(
@@ -303,7 +332,7 @@ impl Panel {
                 "CPU",
                 cpu.map(|r| r.tflops / data.ps5_cpu_tflops),
                 limit,
-                theme::LILAC,
+                theme::lilac(),
             );
             ui.add_space(6.0);
             performance_meter(
@@ -311,10 +340,10 @@ impl Panel {
                 "GPU",
                 graphics.map(|r| r.tflops / data.ps5_gpu_tflops),
                 limit,
-                theme::PINK,
+                theme::pink(),
             );
             if gpu.is_some() && !machine.desktop {
-                text(ui, "GPU ratings cover desktop models only.", theme::MUTED);
+                text(ui, "GPU ratings cover desktop models only.", theme::muted());
             }
         });
     }
@@ -335,14 +364,14 @@ fn performance_meter(ui: &mut Ui, label: &str, ratio: Option<f32>, limit: f32, c
         ui.label(
             RichText::new(label)
                 .font(theme::strong(13.0))
-                .color(theme::WHITE),
+                .color(theme::white()),
         );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let value = ratio.map_or_else(|| "No match".to_owned(), |r| format!("{r:.2}×"));
             ui.label(
                 RichText::new(value)
                     .font(theme::strong(13.0))
-                    .color(if ratio.is_some() { color } else { theme::MUTED }),
+                    .color(if ratio.is_some() { color } else { theme::muted() }),
             );
         });
     });
@@ -351,11 +380,11 @@ fn performance_meter(ui: &mut Ui, label: &str, ratio: Option<f32>, limit: f32, c
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
     let track = rect.shrink2(egui::vec2(0.0, 2.0));
     let x = |r: f32| track.left() + track.width() * (r / limit).clamp(0.0, 1.0);
-    ui.painter().rect_filled(track, 3.0, theme::RAISED);
+    ui.painter().rect_filled(track, 3.0, theme::raised());
     let fill = egui::Rect::from_min_max(track.min, egui::pos2(x(ratio), track.bottom()));
     ui.painter().rect_filled(fill, 3.0, color);
     ui.painter()
-        .vline(x(1.0), rect.y_range(), egui::Stroke::new(2.0_f32, theme::WHITE));
+        .vline(x(1.0), rect.y_range(), egui::Stroke::new(2.0_f32, theme::white()));
     response.on_hover_text(format!(
         "{label} theoretical FP32 throughput relative to PS5. The white marker is 1×."
     ));

@@ -33,7 +33,7 @@ fn binaries(package: &Value) -> impl Iterator<Item = &str> {
         })
 }
 
-pub fn is_victory(workspace: &Path, metadata: &Value) -> bool {
+pub fn is_victory(workspace: &Path, metadata: &Value, from_catalog: bool) -> bool {
     let Some(packages) = metadata["packages"].as_array() else {
         return false;
     };
@@ -41,7 +41,7 @@ pub fn is_victory(workspace: &Path, metadata: &Value) -> bool {
         package["name"] == "victory" && binaries(package).any(|name| name == "victory")
     });
     has_victory_binary
-        && (["apps/victory", "crates/victory", "victory"]
+        && (from_catalog || ["apps/victory", "crates/victory", "victory"]
             .iter()
             .any(|path| workspace.join(path).join("Cargo.toml").is_file())
             || packages.iter().any(|package| {

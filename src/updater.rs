@@ -6,9 +6,9 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
-pub const REPOSITORY: &str = "TheGameOnAddict/mandyhub-sinkfinger";
-pub const RELEASES: &str = "https://github.com/TheGameOnAddict/mandyhub-sinkfinger/releases";
-const ASSET: &str = "Mandyhub.exe";
+pub const REPOSITORY: &str = "TheGameOnAddict/PalmVI_Launcher";
+pub const RELEASES: &str = "https://github.com/TheGameOnAddict/PalmVI_Launcher/releases";
+const ASSET: &str = "PalmVI.exe";
 const MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Deserialize)]
@@ -101,7 +101,7 @@ impl Updater {
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
-        .user_agent(concat!("Mandyhub/", env!("CARGO_PKG_VERSION")))
+        .user_agent(concat!("PalmVI/", env!("CARGO_PKG_VERSION")))
         .build()
 }
 
@@ -146,7 +146,7 @@ fn download_release(release: &Release) -> Result<DownloadedUpdate, String> {
         .assets
         .iter()
         .find(|asset| asset.name == ASSET)
-        .ok_or("This release has no Mandyhub.exe download.")?;
+        .ok_or("This release has no PalmVI.exe download.")?;
     let digest = asset
         .digest
         .as_deref()
@@ -208,7 +208,7 @@ pub fn restart_with(update: &DownloadedUpdate) -> Result<(), String> {
         .write(true)
         .create_new(true)
         .open(&staged)
-        .map_err(|error| format!("Could not stage the update beside Mandyhub: {error}"))?;
+        .map_err(|error| format!("Could not stage the update beside PalmVI: {error}"))?;
     let write_result = file.write_all(&bytes).and_then(|_| file.sync_all());
     drop(file);
     let result = (|| -> Result<(), String> {

@@ -1459,9 +1459,10 @@ dependencies = [
 
 [[package]]
 name = "mandyhub"
-version = "0.2.5"
+version = "0.3.0"
 dependencies = [
  "eframe",
+ "find-msvc-tools",
  "image",
  "rfd",
  "ring",

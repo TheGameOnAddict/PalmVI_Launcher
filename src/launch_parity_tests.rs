@@ -13,6 +13,9 @@ if "%~2"=="--help" (
 >>"%~dp0%~1.txt" echo arg2=%~2
 >>"%~dp0%~1.txt" echo arg3=%~3
 >>"%~dp0%~1.txt" set VICTORY_
+if "%~1"=="shaders" echo victory_gpu::host: 100.0 fps, 10.0 ms/frame
+if "%~1"=="run" echo victory_gpu::host: 20.0 fps, 50.0 ms/frame
+if "%~1"=="run" echo victory_gpu::host: 30.0 fps, 33.3 ms/frame 1>&2
 if "%~1"=="warm" echo 0 pipelines known, 0 made before (fixture), 0 bad; 0 to make, 1 processes
 if "%~1"=="shaders" (
   if exist "%~dp0fail" (
@@ -110,12 +113,13 @@ fn check_launch(direct_script: Option<PathBuf>) {
         script_options: Some(Default::default()), ..Default::default()
     });
     let launch = |saved: &Saved| {
-        let job = Arc::new(Mutex::new(Job::default()));
+        let job = Arc::new(Mutex::new(Job { play_stats: Some(saved.play_stats.clone()), ..Job::default() }));
         play(&job, &egui::Context::default(), &p, &saved.launch(&p.repo, true), &saves::LaunchSave::Continue).unwrap();
         let log = job.lock().unwrap().log.preview();
         log
     };
     let first = launch(&saved);
+    assert!(first.contains("25.0 FPS average across 2 renderer readings"), "{first}");
     assert!(first.contains("Shader totals: 3 cached, 1 could not translate"));
     assert!(first.contains("Pipeline inventory: 0 pipelines known"));
     assert_eq!(snapshot("order.txt").lines().collect::<Vec<_>>(), ["shaders", "warm", "run"]);

@@ -10,6 +10,8 @@
 #![windows_subsystem = "windows"]
 
 mod fullscreen;
+mod discord;
+mod play_stats;
 mod hardware;
 mod slides;
 mod theme;
@@ -95,6 +97,9 @@ impl Project {
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Saved {
+    discord: discord::Settings,
+    play_stats: play_stats::History,
+    include_exact_60_fps: bool,
     game_dir: String,
     /// "8 GB graphics card fix": smaller textures and a grey stand-in for missing ones.
     fix_8gb: bool,
@@ -109,11 +114,17 @@ struct Saved {
     /// Updates put off with "Later": (repo, the new version's commit).
     later: Vec<(String, String)>,
     selected: Option<String>,
+    pinned: Vec<String>,
+    known_projects: Vec<Project>,
+    appearance_initialized: bool,
+    save_choices: std::collections::BTreeMap<String,(String,saves::LaunchSave)>,
+    appearance: ui::Appearance,
     custom: Vec<Project>,
     series_s: bool,
     render_scale: f32,
     extra_env: String,
     gpu_filter: usize,
+    output: OutputResolution,
     /// Translate the shaders into the cache (`victory translate --cache`) before each Play.
     warm_before_play: bool,
     /// With the warm-up, also build the GPU pipelines (`--pipelines`; can take hours).
@@ -275,7 +286,7 @@ impl Saved {
             fix_8gb: self.fix_8gb,
             bright_shadows: self.bright_shadows,
             fullscreen: self.fullscreen,
-            output: OutputResolution::Default,
+            output: self.output,
         }
     }
 
@@ -337,6 +348,8 @@ fn project_launch_overrides_are_independent_and_can_be_empty() {
 /// Shared state of the background job (download, build, play).
 #[derive(Default)]
 struct Job {
+    presence: Option<discord::Presence>,
+    play_stats: Option<play_stats::History>,
     running: bool,
     installing: bool,
     /// The project the job works on.
@@ -469,6 +482,8 @@ mod tests {
 }
 
 struct App {
+    presence: discord::Presence,
+    studio: ui::Studio,
     hardware: hardware::Panel,
     saved: Saved,
     screenshot_projects: Option<Vec<String>>,
@@ -512,7 +527,6 @@ struct App {
     shown: Option<String>,
     shown_at: f64,
     /// When the repo link was last copied: its button shows a tick for a moment.
-    copied_at: f64,
     /// When the open dialog opened (for its entrance), and whether one was open last frame.
     modal_at: f64,
     modal_was_open: bool,
@@ -526,10 +540,15 @@ struct App {
 enum View {
     Projects,
     Settings,
+    Library,
+    Discover,
+    Activity,
+    System,
 }
 
 /// The "Add a repo by link" dialog.
 struct AddRepo {
+    zip: bool,
     link: String,
     error: Option<String>,
     /// Put the cursor in the field on the first frame.
@@ -853,7 +872,7 @@ fn search_drives() -> Result<String, String> {
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Mandyhub")
+            .with_title("PalmVI")
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([960.0, 620.0])
             .with_icon(theme::app_icon()),
@@ -1134,6 +1153,7 @@ impl App {
                     state.import_error = Some(format!("{name}: {error}"));
                 }
             }
+            state.log.save_session(&name,"ZIP import");
             ctx.request_repaint();
         });
     }
@@ -1142,10 +1162,26 @@ impl App {
         theme::install(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx);
         let mut saved: Saved = cc.storage.and_then(|s| eframe::get_value(s, eframe::APP_KEY)).unwrap_or_default();
+        if !saved.appearance_initialized{
+            if slides::folder().read_dir().into_iter().flatten().flatten().any(|e|e.path().extension().and_then(|x|x.to_str()).is_some_and(|x|["jpg","jpeg","png"].iter().any(|a|x.eq_ignore_ascii_case(a)))){saved.appearance.adopt_slideshow();}
+            saved.appearance_initialized=true;
+        }
+        let mut app=Self::from_saved(saved,slides::Slides::new());
+        set_install_dir(&app.saved.install_dir);
+        app.updater.check(&cc.egui_ctx);
+        app.refresh_projects(&cc.egui_ctx);
+        let ctx=cc.egui_ctx.clone();
+        let job=app.job.clone();
+        std::thread::spawn(move ||{let _=tools::detect();job.lock().unwrap().stage.clear();ctx.request_repaint();});
+        app
+    }
+
+    fn from_saved(mut saved: Saved,slides:slides::Slides)->Self{
         if saved.render_scale <= 0.0 {
             saved.render_scale = 0.5;
         }
         let mut app = App {
+            presence: discord::Presence::new(),
             hardware: hardware::Panel::default(),
             saved,
             screenshot_projects: None,
@@ -1164,18 +1200,18 @@ impl App {
             empty: false,
             finding: Arc::new(Mutex::new(None)),
             repos: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            show_log: false,
+            show_log: true,
             log_expanded: false,
             log_export_status: None,
-            slides: slides::Slides::new(),
+            slides,
             last_auto_check: -1.0,
-            view: View::Projects,
+            studio: ui::Studio::default(),
+            view: View::Library,
             search: String::new(),
             add_repo: None,
             find_error: None,
             shown: None,
             shown_at: 0.0,
-            copied_at: -10.0,
             modal_at: 0.0,
             modal_was_open: false,
             title_bar_done: false,
@@ -1188,16 +1224,6 @@ impl App {
             app.saved.series_s = true;
             app.saved.render_scale = 0.5;
         }
-        set_install_dir(&app.saved.install_dir);
-        app.updater.check(&cc.egui_ctx);
-        app.refresh_projects(&cc.egui_ctx);
-        let ctx = cc.egui_ctx.clone();
-        let job = app.job.clone();
-        std::thread::spawn(move || {
-            let _ = tools::detect();
-            job.lock().unwrap().stage = String::new();
-            ctx.request_repaint();
-        });
         app
     }
 
@@ -1241,6 +1267,7 @@ impl App {
         if let Some(Ok(list)) = &*self.projects.lock().unwrap() {
             v.extend(list.iter().cloned());
         }
+        for p in &self.saved.known_projects{if !v.iter().any(|q|q.repo==p.repo){v.push(p.clone());}}
         v
     }
 
@@ -1301,6 +1328,11 @@ impl App {
     fn start(&mut self, ctx: &egui::Context, p: Project, kind: Kind) {
         if self.job.lock().unwrap().running { return; }
         let Some(job) = self.project_jobs.start(&p.repo, kind == Kind::Install, "Starting") else { return; };
+        if matches!(kind, Kind::Play(_)) {
+            let mut play_job = job.lock().unwrap();
+            play_job.presence = Some(self.presence.clone());
+            play_job.play_stats = Some(self.saved.play_stats.clone());
+        }
         // An install over an installed project is an update.
         let updating = kind == Kind::Install && project_installed(&p.repo);
         if kind == Kind::Install {
@@ -1325,7 +1357,7 @@ impl App {
         let launch = self.saved.launch(&p.repo, matches!(&script, Ok(Some((_, true)))));
         if matches!(kind, Kind::Play(_) | Kind::Warm) {
             let mut job = job.lock().unwrap();
-            job.log.report(concat!("Mandyhub version: ", env!("CARGO_PKG_VERSION")));
+            job.log.report(concat!("PalmVI version: ", env!("CARGO_PKG_VERSION")));
             job.log.report(format!("Project: {} ({})", p.name, p.repo));
             match script {
                 Ok(Some((name, _))) => job.log.report(format!("Loaded current repository preset: {name} (profile edits retained).")),
@@ -1401,6 +1433,8 @@ impl App {
                         j.log.push(format!("ERROR: {e}"));
                     }
                 }
+                let action=match kind{Kind::Play(_)=>"Play",Kind::Install if updating=>"Update",Kind::Install=>"Install",Kind::Warm=>"Shader warm-up",Kind::Uninstall=>"Uninstall"};
+                j.log.save_session(&p.name,action);
             }
             ctx.request_repaint();
         });
@@ -1458,7 +1492,7 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, updating: bo
 fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &Path, target: &Path) -> Result<(), String> {
     let workspace = cargo_workspace(dir)?;
     let metadata = rust_project::metadata(&workspace)?;
-    let victory = !p.custom || rust_project::is_victory(&workspace, &metadata);
+    let victory = rust_project::is_victory(&workspace, &metadata, !p.custom);
     let profile = if victory { detect_build_profile(&workspace) } else { "release" };
     let has_lockfile = workspace.join("Cargo.lock").is_file();
     let mut cargo = tools::cargo();
@@ -1493,7 +1527,7 @@ fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &
         cargo.args(["--workspace", "--message-format=json-render-diagnostics"]);
         let artifacts = Arc::new(Mutex::new(Vec::new()));
         let captured = artifacts.clone();
-        run_with_output(job, ctx, &mut cargo, |_| {}, move |line| {
+        run_with_output(job, ctx, &mut cargo, None, |_| {}, move |line| {
             let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else { return Some(line) };
             if message["reason"] == "compiler-artifact" && message["executable"].is_string() {
                 captured.lock().unwrap().push(message);
@@ -1517,7 +1551,7 @@ fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &
 /// Deletes `p`'s download and build (and its shader cache); its saves stay.
 fn uninstall(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project) -> Result<(), String> {
     if p.local_exe.is_some() {
-        return Err("this build was not installed by Mandyhub".into());
+        return Err("this build was not installed by PalmVI".into());
     }
     stage(job, ctx, "Uninstalling");
     let ws = workspace();
@@ -1748,7 +1782,7 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, base: &Command, l: &Launch) 
         let captured = shader_totals.clone();
         let pipeline_summary = Arc::new(Mutex::new(None));
         let pipeline_output = pipeline_summary.clone();
-        let result = run_with_output(job, ctx, &mut command, |pid| {
+        let result = run_with_output(job, ctx, &mut command, None, |pid| {
             let mut j = job.lock().unwrap();
             j.pid = Some(pid);
             j.stoppable = true;
@@ -1839,7 +1873,7 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
         j.log.command("Program launch", &command, false);
         drop(j);
         stage(job, ctx, "Playing");
-        return run_with(job, ctx, &mut command, |_| {
+        return run_game(job, ctx, &mut command, p, |_| {
             if let Err(error) = build_activity::BuildActivity::record_run(&target_dir(&p.repo)) {
                 job.lock().unwrap().log.push(format!("Could not record the launch: {error}"));
             }
@@ -1896,7 +1930,8 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
         }
     }
     let fullscreen = l.fullscreen;
-    run_with(job, ctx, &mut c, |pid| {
+    run_game(job, ctx, &mut c, p, |pid| {
+        let session = job.lock().unwrap().presence.take().map(|rpc| rpc.game_started(pid));
         if p.local_exe.is_none() {
             if let Err(error) = build_activity::BuildActivity::record_run(&target_dir(&p.repo)) {
                 job.lock().unwrap().log.push(format!("Could not record the launch: {error}"));
@@ -1905,39 +1940,47 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
         if fullscreen {
             fullscreen::keep_borderless(pid);
         }
+        session
     })
 }
 
 /// Runs `c`, its output lines into the job's log.
 fn run(job: &Arc<Mutex<Job>>, ctx: &egui::Context, c: &mut Command) -> Result<(), String> {
-    run_with(job, ctx, c, |_| {})
+    run_with_output(job, ctx, c, None, |_| {}, Some)
 }
 
-/// [`run`], telling `spawned` the process id once it started.
-fn run_with(job: &Arc<Mutex<Job>>, ctx: &egui::Context, c: &mut Command, spawned: impl FnOnce(u32)) -> Result<(), String> {
-    run_with_output(job, ctx, c, spawned, Some)
+fn run_game<T>(job: &JobHandle, ctx: &egui::Context, c: &mut Command, p: &Project, spawned: impl FnOnce(u32) -> T) -> Result<(), String> {
+    run_with_output(job, ctx, c, Some(&p.repo), spawned, Some)
 }
 
-fn run_with_output(
+fn run_with_output<T>(
     job: &Arc<Mutex<Job>>,
     ctx: &egui::Context,
     c: &mut Command,
-    spawned: impl FnOnce(u32),
+    playing_repo: Option<&str>,
+    spawned: impl FnOnce(u32) -> T,
     filter: impl Fn(String) -> Option<String> + Send + Sync + 'static,
 ) -> Result<(), String> {
     c.stdout(Stdio::piped()).stderr(Stdio::piped());
     hide_window(c);
     let mut child = c.spawn().map_err(|e| format!("could not start {:?}: {e}", c.get_program()))?;
-    spawned(child.id());
+    let session = playing_repo.and_then(|repo| {
+        job.lock().unwrap().play_stats.as_ref().map(|history| Arc::new(history.start(project_key(repo))))
+    });
+    let process_lifetime = spawned(child.id());
     let (out, err) = (child.stdout.take(), child.stderr.take());
     let filter = Arc::new(filter);
     let pipe = |r: Box<dyn std::io::Read + Send>, filter_stdout: bool| {
         let (job, ctx) = (job.clone(), ctx.clone());
         let filter = filter.clone();
+        let session = session.clone();
         std::thread::spawn(move || {
             for bytes in BufReader::new(r).split(b'\n').map_while(Result::ok) {
                 let line = String::from_utf8_lossy(bytes.strip_suffix(b"\r").unwrap_or(&bytes)).into_owned();
                 let Some(line) = (if filter_stdout { filter(line) } else { Some(line) }) else { continue };
+                if let Some(session) = &session {
+                    session.observe(&line);
+                }
                 let mut j = job.lock().unwrap();
                 j.log.push(line);
                 drop(j);
@@ -1948,8 +1991,13 @@ fn run_with_output(
     let a = out.map(|o| pipe(Box::new(o), true));
     let b = err.map(|e| pipe(Box::new(e), false));
     let status = child.wait().map_err(|e| e.to_string())?;
+    if let Some(session) = &session { session.stop_clock(); }
+    drop(process_lifetime);
     for t in [a, b].into_iter().flatten() {
         let _ = t.join();
+    }
+    if let Some(session) = session {
+        job.lock().unwrap().log.report(session.summary());
     }
     status.success().then_some(()).ok_or_else(|| format!("{:?} ended with {status}", c.get_program()))
 }
@@ -1994,12 +2042,13 @@ impl eframe::App for App {
             if let Some(repo) = removed {
                 discarded_archives.push(key.clone());
                 self.saved.custom.retain(|project| project.repo != repo);
-                if self.saved.selected.as_deref() == Some(&repo) { self.saved.selected = None; }
+                self.saved.pinned.retain(|r|r!=&repo);
+                if self.saved.selected.as_deref() == Some(&repo) { self.saved.selected = None;if self.view==View::Projects{self.view=View::Library;} }
             }
         }
         for key in discarded_archives { self.project_jobs.0.remove(&key); }
         if !self.title_bar_done {
-            self.title_bar_done = fullscreen::dark_title_bar(std::process::id(), theme::BG, theme::WHITE);
+            self.title_bar_done = fullscreen::dark_title_bar(std::process::id(), theme::bg(), theme::white());
         }
         // A size remembered from a minimized window can come back tiny: then the normal size.
         if !self.size_checked {
@@ -2012,6 +2061,7 @@ impl eframe::App for App {
             }
         }
         self.draw(ctx);
+        self.presence.configure(&self.saved.discord);
         if self.updater.restart_requested && !self.any_job_running() {
             if let updater::State::Downloaded(update) = &self.updater.state {
                 self.updater.restart_requested = false;
@@ -2077,6 +2127,7 @@ impl App {
                     j.log.push(format!("ERROR: {e}"));
                 }
             }
+            j.log.save_session("Workspace","Build tools");
             ctx.request_repaint();
         });
     }
@@ -2140,6 +2191,7 @@ impl App {
                     j.log.push(format!("ERROR: {e}"));
                 }
             }
+            j.log.save_session("Workspace","Move projects");
             repos.lock().unwrap().clear();
             ctx.request_repaint();
         });
@@ -2157,7 +2209,9 @@ impl App {
         }
         self.last_auto_check = now;
         for p in self.all_projects() {
-            if p.is_git() && project_installed(&p.repo) {
+            if !p.is_git() || project_installed(&p.repo) {
+                if !p.custom&&!self.saved.known_projects.iter().any(|q|q.repo==p.repo){self.saved.known_projects.push(p.clone());}
+                if p.is_git(){self.repos.lock().unwrap().entry(p.repo.clone()).or_insert_with(||RepoState{installed:true,activity:build_activity::BuildActivity::read(&target_dir(&p.repo)),..Default::default()});}
                 self.check_repo(ctx, &p, false);
             }
         }

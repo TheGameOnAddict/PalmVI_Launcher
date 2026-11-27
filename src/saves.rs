@@ -11,7 +11,7 @@ pub fn delete_save(workspace: &Path, source: &Path) -> io::Result<PathBuf> {
     let relative = source.strip_prefix(&workspace).map_err(|_| {
         io::Error::new(
             ErrorKind::InvalidInput,
-            "The save is outside Mandyhub’s workspace.",
+            "The save is outside PalmVI’s workspace.",
         )
     })?;
     let save_folder = relative.starts_with("data") && relative.ends_with(SAVE_PATH);
@@ -23,7 +23,7 @@ pub fn delete_save(workspace: &Path, source: &Path) -> io::Result<PathBuf> {
     if !(save_folder || checkpoint) || !source.is_dir() {
         return Err(io::Error::new(
             ErrorKind::InvalidInput,
-            "This is not a Mandyhub save folder.",
+            "This is not a PalmVI save folder.",
         ));
     }
     let deleted = workspace.join("deleted-saves");
@@ -50,7 +50,7 @@ pub fn delete_save(workspace: &Path, source: &Path) -> io::Result<PathBuf> {
     Ok(destination)
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum LaunchSave {
     Continue,
     Fresh,

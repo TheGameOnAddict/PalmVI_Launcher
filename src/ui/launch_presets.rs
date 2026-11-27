@@ -347,7 +347,7 @@ pub(super) fn show(
 
         if picker.confirm_delete {
             if let Some(name) = picker.selected.clone() {
-                wrapped(ui, &format!("Delete “{name}” from your preset library? Projects keep the settings already applied."), theme::BLUSH);
+                wrapped(ui, &format!("Delete “{name}” from your preset library? Projects keep the settings already applied."), theme::blush());
                 ui.horizontal_wrapped(|ui| {
                     if theme::small(ui, Look::Danger, None, "Delete preset", true).clicked() {
                         presets.retain(|preset| preset.name != name);
@@ -384,8 +384,8 @@ fn reset_to_global(ui: &mut Ui, value: &mut Option<String>) -> bool {
 
 fn show_status(ui: &mut Ui, status: &Option<Result<String, String>>) {
     match status {
-        Some(Ok(message)) => wrapped(ui, message, theme::MUTED),
-        Some(Err(error)) => wrapped(ui, error, theme::BAD),
+        Some(Ok(message)) => wrapped(ui, message, theme::muted()),
+        Some(Err(error)) => wrapped(ui, error, theme::bad()),
         None => {}
     }
 }

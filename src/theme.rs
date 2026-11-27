@@ -16,45 +16,42 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
-// The night, from the site's own grounds and panels.
-pub const BG: Color32 = Color32::from_rgb(0x0c, 0x0d, 0x1b);
-/// The list and the status bar: a step up from the ground.
-pub const DEEP: Color32 = Color32::from_rgb(0x10, 0x11, 0x24);
-const NIGHT_HI: Color32 = Color32::from_rgb(0x1f, 0x1f, 0x38);
-pub const SURFACE: Color32 = Color32::from_rgb(0x1c, 0x1c, 0x34);
-const SURFACE_LOW: Color32 = Color32::from_rgb(0x15, 0x16, 0x2b);
-pub const RAISED: Color32 = Color32::from_rgb(0x2f, 0x2e, 0x52);
-const RAISED_HI: Color32 = Color32::from_rgb(0x38, 0x36, 0x5d);
-const FIELD: Color32 = Color32::from_rgb(0x14, 0x15, 0x2b);
-pub const LINE: Color32 = Color32::from_rgb(0x30, 0x30, 0x55);
-pub const LINE_STRONG: Color32 = Color32::from_rgb(0x46, 0x44, 0x72);
-const LINE_HI: Color32 = Color32::from_rgb(0x55, 0x51, 0x86);
-// Type.
-pub const WHITE: Color32 = Color32::WHITE;
-/// The site's reading colour: pale blush.
-pub const BLUSH: Color32 = Color32::from_rgb(0xfb, 0xd9, 0xe0);
-/// The site's small headings.
-pub const LILAC: Color32 = Color32::from_rgb(0xcc, 0xc2, 0xf5);
-pub const MUTED: Color32 = Color32::from_rgb(0xc6, 0xc1, 0xe2);
-pub const FAINT: Color32 = Color32::from_rgb(0xa7, 0xa2, 0xc9);
-// The sunset.
-pub const PINK: Color32 = Color32::from_rgb(0xff, 0xbe, 0xcf);
-const PINK_HI: Color32 = Color32::from_rgb(0xff, 0xd3, 0xde);
-/// Type on pink and on the strip.
-pub const PLUM: Color32 = Color32::from_rgb(0x43, 0x31, 0x52);
-const PEACH: Color32 = Color32::from_rgb(0xff, 0xbd, 0xad);
-const MAUVE: Color32 = Color32::from_rgb(0xce, 0x8b, 0xb5);
-const LAVENDER: Color32 = Color32::from_rgb(0x91, 0x6f, 0xb4);
-// Status, in the same pastel key.
-pub const GOOD: Color32 = Color32::from_rgb(0x8e, 0xe3, 0xc8);
-pub const WARN: Color32 = Color32::from_rgb(0xff, 0xd0, 0x8a);
-pub const BAD: Color32 = Color32::from_rgb(0xff, 0x8f, 0x8f);
-const ON_BAD: Color32 = Color32::from_rgb(0x2a, 0x0c, 0x12);
-
+const PEACH:Color32=Color32::from_rgb(255,189,173);
+const MAUVE:Color32=Color32::from_rgb(206,139,181);
+const LAVENDER:Color32=Color32::from_rgb(145,111,180);
+const ON_BAD:Color32=Color32::from_rgb(42,12,18);
 pub const R: f32 = 10.0;
 pub const R_LG: f32 = 16.0;
 /// The height of every field and normal button.
 pub const CONTROL_H: f32 = 34.0;
+
+thread_local!{
+    static PALETTE:std::cell::Cell<([[u8;3];14],bool)>=const{std::cell::Cell::new((crate::ui::MIDNIGHT,true))};
+    static GLASS_DARKNESS:std::cell::Cell<u8> = const { std::cell::Cell::new(35) };
+}
+pub fn set_palette(ctx:&egui::Context,colors:[[u8;3];14],glass:bool,darkness:u8){
+    GLASS_DARKNESS.set(darkness.min(100));
+    if PALETTE.replace((colors,glass))!=(colors,glass){refresh_style(ctx);}
+}
+pub fn bg()->Color32{palette_color(4)}
+pub fn deep()->Color32{palette_color(5)}
+pub fn surface()->Color32{palette_color(6)}
+pub fn raised()->Color32{palette_color(7)}
+pub fn line()->Color32{palette_color(8)}
+pub fn line_strong()->Color32{palette_color(8)}
+pub fn white()->Color32{palette_color(2)}
+pub fn blush()->Color32{palette_color(2)}
+pub fn lilac()->Color32{palette_color(1)}
+pub fn muted()->Color32{palette_color(3)}
+pub fn faint()->Color32{palette_color(3)}
+pub fn pink()->Color32{palette_color(0)}
+pub fn action_text()->Color32{let color=egui::Rgba::from(pink());if color.r()*0.2126+color.g()*0.7152+color.b()*0.0722>0.18{Color32::from_rgb(39,28,38)}else{Color32::WHITE}}
+pub fn good()->Color32{palette_color(9)}
+pub fn warn()->Color32{palette_color(12)}
+pub fn bad()->Color32{palette_color(13)}
+pub fn palette_color(i:usize)->Color32{
+    let [r,g,b]=PALETTE.get().0[i];Color32::from_rgb(r,g,b)
+}
 
 /// Segoe Fluent Icons (Windows 11) and Segoe MDL2 Assets (Windows 10) share these.
 pub mod glyph {
@@ -104,9 +101,6 @@ pub fn deco(size: f32) -> FontId {
     FontId::new(size, family("deco"))
 }
 /// Buttons: Josefin Sans SemiBold.
-pub fn deco_semi(size: f32) -> FontId {
-    FontId::new(size, family("deco-semi"))
-}
 pub fn mono(size: f32) -> FontId {
     FontId::monospace(size)
 }
@@ -164,24 +158,9 @@ pub fn install(ctx: &egui::Context) {
 /// The site's colour runs as small pictures that shapes are filled with,
 /// which keeps rounded corners smooth: the sunset strip (across), the sky
 /// (down, peach to lavender) and the panel light (down, a lit top).
-static STRIP: OnceLock<egui::TextureHandle> = OnceLock::new();
 static SKY: OnceLock<egui::TextureHandle> = OnceLock::new();
-static PANEL: OnceLock<egui::TextureHandle> = OnceLock::new();
-const STRIP_STOPS: [(f32, Color32); 4] = [
-    (0.0, Color32::from_rgb(0xff, 0xc9, 0xb8)),
-    (0.38, Color32::from_rgb(0xfb, 0xb7, 0xcb)),
-    (0.72, Color32::from_rgb(0xd9, 0x9b, 0xc4)),
-    (1.0, Color32::from_rgb(0xa8, 0x87, 0xcc)),
-];
 const SKY_STOPS: [(f32, Color32); 3] = [(0.0, PEACH), (0.5, MAUVE), (1.0, LAVENDER)];
-const PANEL_STOPS: [(f32, Color32); 2] = [(0.0, SURFACE), (1.0, SURFACE_LOW)];
 
-#[derive(Clone, Copy)]
-pub enum Fill {
-    Strip,
-    Sky,
-    Panel,
-}
 
 fn sample(stops: &[(f32, Color32)], t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
@@ -190,7 +169,7 @@ fn sample(stops: &[(f32, Color32)], t: f32) -> Color32 {
             return mix(w[0].1, w[1].1, (t - w[0].0) / (w[1].0 - w[0].0).max(1e-6));
         }
     }
-    stops.last().map_or(PINK, |s| s.1)
+    stops.last().map_or(pink(), |s| s.1)
 }
 
 fn gradient_image(len: usize, stops: &[(f32, Color32)], down: bool) -> egui::ColorImage {
@@ -201,45 +180,47 @@ fn gradient_image(len: usize, stops: &[(f32, Color32)], down: bool) -> egui::Col
 /// The night theme, always (it does not follow the system's light mode).
 pub fn apply(ctx: &egui::Context) {
     let linear = egui::TextureOptions::LINEAR;
-    let _ = STRIP.set(ctx.load_texture("strip", gradient_image(512, &STRIP_STOPS, false), linear));
     let _ = SKY.set(ctx.load_texture("sky", gradient_image(256, &SKY_STOPS, true), linear));
-    let _ = PANEL.set(ctx.load_texture("panel", gradient_image(256, &PANEL_STOPS, true), linear));
+    refresh_style(ctx);
+}
+
+fn refresh_style(ctx:&egui::Context){
     ctx.set_theme(egui::ThemePreference::Dark);
     ctx.style_mut_of(egui::Theme::Dark, |s| {
         let v = &mut s.visuals;
         v.override_text_color = None;
-        v.panel_fill = BG;
-        v.window_fill = SURFACE;
-        v.window_stroke = Stroke::new(1.0, LINE_STRONG);
+        v.panel_fill = bg();
+        v.window_fill = surface();
+        v.window_stroke = Stroke::new(1.0_f32, line_strong());
         v.window_rounding = Rounding::same(R_LG);
         v.window_shadow = shadow();
         v.popup_shadow = Shadow { offset: vec2(0.0, 6.0), blur: 18.0, spread: 0.0, color: Color32::from_black_alpha(140) };
         v.menu_rounding = Rounding::same(R);
-        v.extreme_bg_color = FIELD;
-        v.faint_bg_color = SURFACE;
-        v.code_bg_color = SURFACE;
-        v.hyperlink_color = PINK;
-        v.selection.bg_fill = PINK.gamma_multiply(0.35);
-        v.selection.stroke = Stroke::new(1.0, PINK);
-        v.text_cursor.stroke = Stroke::new(1.5, WHITE);
+        v.extreme_bg_color = deep();
+        v.faint_bg_color = surface();
+        v.code_bg_color = surface();
+        v.hyperlink_color = pink();
+        v.selection.bg_fill = pink().gamma_multiply(0.35);
+        v.selection.stroke = Stroke::new(1.0_f32, pink());
+        v.text_cursor.stroke = Stroke::new(1.5_f32, white());
         let w = &mut v.widgets;
-        w.noninteractive.bg_fill = SURFACE;
-        w.noninteractive.weak_bg_fill = SURFACE;
-        w.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-        w.noninteractive.fg_stroke = Stroke::new(1.0, MUTED);
-        w.inactive.bg_fill = RAISED;
-        w.inactive.weak_bg_fill = RAISED;
-        w.inactive.bg_stroke = Stroke::new(1.0, LINE_STRONG);
-        w.inactive.fg_stroke = Stroke::new(1.0, WHITE);
-        w.hovered.bg_fill = RAISED_HI;
-        w.hovered.weak_bg_fill = RAISED_HI;
-        w.hovered.bg_stroke = Stroke::new(1.0, LINE_HI);
-        w.hovered.fg_stroke = Stroke::new(1.0, WHITE);
+        w.noninteractive.bg_fill = surface();
+        w.noninteractive.weak_bg_fill = surface();
+        w.noninteractive.bg_stroke = Stroke::new(1.0_f32, line());
+        w.noninteractive.fg_stroke = Stroke::new(1.0_f32, muted());
+        w.inactive.bg_fill = raised();
+        w.inactive.weak_bg_fill = raised();
+        w.inactive.bg_stroke = Stroke::new(1.0_f32, line_strong());
+        w.inactive.fg_stroke = Stroke::new(1.0_f32, white());
+        w.hovered.bg_fill = mix(raised(), white(), 0.07);
+        w.hovered.weak_bg_fill = mix(raised(), white(), 0.07);
+        w.hovered.bg_stroke = Stroke::new(1.0_f32, line_strong());
+        w.hovered.fg_stroke = Stroke::new(1.0_f32, white());
         w.hovered.expansion = 0.0;
-        w.active.bg_fill = RAISED_HI;
-        w.active.weak_bg_fill = RAISED_HI;
-        w.active.bg_stroke = Stroke::new(1.0, PINK);
-        w.active.fg_stroke = Stroke::new(1.0, WHITE);
+        w.active.bg_fill = mix(raised(), white(), 0.07);
+        w.active.weak_bg_fill = mix(raised(), white(), 0.07);
+        w.active.bg_stroke = Stroke::new(1.0_f32, pink());
+        w.active.fg_stroke = Stroke::new(1.0_f32, white());
         w.active.expansion = 0.0;
         w.open = w.hovered;
         for x in [&mut w.noninteractive, &mut w.inactive, &mut w.hovered, &mut w.active, &mut w.open] {
@@ -252,8 +233,8 @@ pub fn apply(ctx: &egui::Context) {
         s.text_styles = [
             (TextStyle::Small, regular(12.0)),
             (TextStyle::Body, regular(14.0)),
-            (TextStyle::Button, deco_semi(14.0)),
-            (TextStyle::Heading, display(28.0)),
+            (TextStyle::Button, strong(13.0)),
+            (TextStyle::Heading, strong(20.0)),
             (TextStyle::Monospace, mono(12.5)),
         ]
         .into();
@@ -282,34 +263,14 @@ fn hover(ui: &Ui, id: Id, on: bool) -> f32 {
 }
 
 /// Fills `rect` with one of the colour runs; `tint` white is full strength.
-pub fn fill(painter: &egui::Painter, rect: Rect, rounding: impl Into<Rounding>, which: Fill, tint: Color32) {
-    let rounding = rounding.into();
-    let tex = match which {
-        Fill::Strip => &STRIP,
-        Fill::Sky => &SKY,
-        Fill::Panel => &PANEL,
-    };
-    match tex.get() {
-        Some(tex) => {
-            let mut shape = egui::epaint::RectShape::filled(rect, rounding, tint);
-            shape.fill_texture_id = tex.id();
-            shape.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-            painter.add(shape);
-        }
-        None => {
-            painter.rect_filled(rect, rounding, SURFACE);
-        }
-    }
-}
-
 /// The page's ground: the night a little lit at the top, as on the site.
 pub fn ground(painter: &egui::Painter, rect: Rect) {
     let lit = Rect::from_min_size(rect.min, vec2(rect.width(), rect.height().min(520.0)));
     let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(lit.left_top(), NIGHT_HI);
-    mesh.colored_vertex(lit.right_top(), NIGHT_HI);
-    mesh.colored_vertex(lit.left_bottom(), BG);
-    mesh.colored_vertex(lit.right_bottom(), BG);
+    mesh.colored_vertex(lit.left_top(), raised());
+    mesh.colored_vertex(lit.right_top(), raised());
+    mesh.colored_vertex(lit.left_bottom(), bg());
+    mesh.colored_vertex(lit.right_bottom(), bg());
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(1, 3, 2);
     painter.add(egui::Shape::mesh(mesh));
@@ -317,25 +278,15 @@ pub fn ground(painter: &egui::Painter, rect: Rect) {
 
 /// A round mark in the sky's colours.
 pub fn mark(painter: &egui::Painter, center: Pos2, radius: f32) {
-    fill(painter, Rect::from_center_size(center, vec2(radius * 2.0, radius * 2.0)), radius, Fill::Sky, Color32::WHITE);
+    let rect=Rect::from_center_size(center,vec2(radius*2.0,radius*2.0));
+    if let Some(tex)=SKY.get(){let mut s=egui::epaint::RectShape::filled(rect,radius,Color32::WHITE);s.fill_texture_id=tex.id();s.uv=Rect::from_min_max(pos2(0.,0.),pos2(1.,1.));painter.add(s);}else{painter.circle_filled(center,radius,pink());}
 }
 
-/// The window's icon: the same round mark.
+/// PalmVI's window and taskbar mark, matching the executable's icon resource.
 pub fn app_icon() -> egui::IconData {
-    let n = 64usize;
-    let mut rgba = vec![0u8; n * n * 4];
-    let c = (n as f32 - 1.0) / 2.0;
-    let r = n as f32 * 0.47;
-    for y in 0..n {
-        for x in 0..n {
-            let (dx, dy) = (x as f32 - c, y as f32 - c);
-            let edge = (r - (dx * dx + dy * dy).sqrt() + 0.5).clamp(0.0, 1.0);
-            let col = sample(&SKY_STOPS, (y as f32 - (c - r)) / (2.0 * r));
-            let i = (y * n + x) * 4;
-            rgba[i..i + 4].copy_from_slice(&[col.r(), col.g(), col.b(), (edge * 255.0) as u8]);
-        }
-    }
-    egui::IconData { rgba, width: n as u32, height: n as u32 }
+    let image = image::load_from_memory(include_bytes!("../data/palmvi.png"))
+        .expect("bundled PalmVI icon").into_rgba8();
+    egui::IconData { width: image.width(), height: image.height(), rgba: image.into_raw() }
 }
 
 /// Spaced capitals, the way the site sets its labels.
@@ -354,14 +305,13 @@ fn caps_galley(painter: &egui::Painter, text: &str, size: f32, track: f32) -> Ar
 /// A big white name in condensed capitals, shrunk to fit `max_width`.
 pub fn title(ui: &mut Ui, text: &str, size: f32, max_width: f32) -> Response {
     let painter = ui.painter().clone();
-    let upper = text.to_uppercase();
-    let mut galley = painter.layout_no_wrap(upper.clone(), display(size), WHITE);
+    let mut galley = painter.layout_no_wrap(text.to_string(), deco(size), white());
     if galley.size().x > max_width {
         let fit = (size * max_width / galley.size().x).max(size * 0.5);
-        galley = painter.layout_no_wrap(upper, display(fit), WHITE);
+        galley = painter.layout_no_wrap(text.to_string(), deco(fit), white());
     }
     let (rect, resp) = ui.allocate_exact_size(galley.size(), Sense::hover());
-    painter.galley(rect.min, galley, WHITE);
+    painter.galley(rect.min, galley, white());
     resp
 }
 
@@ -385,8 +335,6 @@ pub enum Look {
     Ghost,
     /// A ghost button with a pulsing status colour.
     Signal(Color32, f32),
-    /// A navy pill, for the sunset strip.
-    Night,
     /// A destructive action offered next to others.
     Danger,
     /// The confirm button of a destructive dialog.
@@ -397,29 +345,27 @@ pub enum Look {
 pub enum Size {
     Small,
     Normal,
-    Large,
 }
 
 /// Fill, border and text colour of a button.
 fn colors(look: Look, t: f32, live: bool) -> (Color32, Stroke, Color32) {
     if !live {
         return match look {
-            Look::Ghost | Look::Danger => (Color32::TRANSPARENT, Stroke::NONE, FAINT.gamma_multiply(0.75)),
-            _ => (SURFACE, Stroke::new(1.0, LINE), FAINT),
+            Look::Ghost | Look::Danger => (Color32::TRANSPARENT, Stroke::NONE, faint().gamma_multiply(0.75)),
+            _ => (surface(), Stroke::new(1.0_f32, line()), faint()),
         };
     }
     match look {
-        Look::Primary => (mix(PINK, PINK_HI, t), Stroke::NONE, PLUM),
-        Look::Secondary => (mix(RAISED, RAISED_HI, t), Stroke::new(1.0, mix(LINE_STRONG, PINK, 0.5 * t)), WHITE),
-        Look::Ghost => (mix(Color32::TRANSPARENT, RAISED, t), Stroke::NONE, mix(LILAC, WHITE, t)),
+        Look::Primary => (mix(pink(), white(), 0.14*t), Stroke::NONE, action_text()),
+        Look::Secondary => (mix(raised(), mix(raised(), white(), 0.07), t), Stroke::new(1.0_f32, mix(line_strong(), pink(), 0.5 * t)), white()),
+        Look::Ghost => (mix(Color32::TRANSPARENT, raised(), t), Stroke::NONE, mix(lilac(), white(), t)),
         Look::Signal(color, strength) => (
-            mix(mix(Color32::TRANSPARENT, RAISED, t), color, 0.2 * strength),
+            mix(mix(Color32::TRANSPARENT, raised(), t), color, 0.2 * strength),
             Stroke::new(1.0_f32, color.gamma_multiply(0.8 * strength)),
-            mix(mix(LILAC, WHITE, t), color, strength),
+            mix(mix(lilac(), white(), t), color, strength),
         ),
-        Look::Night => (mix(BG, NIGHT_HI, t), Stroke::NONE, WHITE),
-        Look::Danger => (mix(Color32::TRANSPARENT, BAD.gamma_multiply(0.14), t), Stroke::NONE, BAD),
-        Look::DangerSolid => (mix(BAD, WHITE, 0.15 * t), Stroke::NONE, ON_BAD),
+        Look::Danger => (mix(Color32::TRANSPARENT, bad().gamma_multiply(0.14), t), Stroke::NONE, bad()),
+        Look::DangerSolid => (mix(bad(), white(), 0.15 * t), Stroke::NONE, ON_BAD),
     }
 }
 
@@ -429,10 +375,9 @@ pub fn button_ex(ui: &mut Ui, look: Look, size: Size, icon: Option<char>, label:
     let (h, fs, pad, min_w) = match size {
         Size::Small => (28.0, 13.0, 12.0, 0.0),
         Size::Normal => (CONTROL_H, 14.0, 16.0, 0.0),
-        Size::Large => (46.0, 16.0, 26.0, 176.0),
     };
     let painter = ui.painter().clone();
-    let label_g = (!label.is_empty()).then(|| painter.layout_no_wrap(label.to_owned(), deco_semi(fs), Color32::PLACEHOLDER));
+    let label_g = (!label.is_empty()).then(|| painter.layout_no_wrap(label.to_owned(), strong(fs), Color32::PLACEHOLDER));
     let icon_g = icon
         .filter(|_| has_icons() && !busy)
         .map(|c| painter.layout_no_wrap(c.to_string(), glyphs(fs), Color32::PLACEHOLDER));
@@ -451,7 +396,7 @@ pub fn button_ex(ui: &mut Ui, look: Look, size: Size, icon: Option<char>, label:
         if down {
             r = r.shrink2(r.size() * 0.0075);
         }
-        painter.rect(r, r.height() / 2.0, fill, stroke);
+        painter.rect(r, 7.0, fill, stroke);
         let mut x = r.center().x - content / 2.0;
         let cy = r.center().y;
         if busy {
@@ -468,7 +413,7 @@ pub fn button_ex(ui: &mut Ui, look: Look, size: Size, icon: Option<char>, label:
             painter.galley(pos2(x, cy - g.size().y / 2.0 + fs * 0.08), g, fg);
         }
         if resp.has_focus() {
-            painter.rect_stroke(r.expand(3.0), r.height() / 2.0 + 3.0, Stroke::new(2.0, PINK));
+            painter.rect_stroke(r.expand(3.0), 8.0, Stroke::new(2.0_f32, pink()));
         }
     }
     if live {
@@ -501,15 +446,14 @@ pub fn field(ui: &mut Ui, value: &mut String, hint: &str, width: f32, lead: Opti
     let lead = lead.filter(|_| has_icons());
     let margin = Margin { left: if lead.is_some() { 38.0 } else { 14.0 }, right: 14.0, top: 0.0, bottom: 0.0 };
     let edit = egui::TextEdit::singleline(value)
-        .hint_text(RichText::new(hint).color(FAINT))
+        .hint_text(RichText::new(hint).color(faint()))
         .font(regular(14.0))
-        .text_color(WHITE)
+        .text_color(white())
         .margin(margin)
         .min_size(vec2(width, CONTROL_H))
         .desired_width((width - margin.left - margin.right).max(24.0))
         .vertical_align(egui::Align::Center);
-    // A pill, like every button and the filters.
-    let pill = CONTROL_H / 2.0;
+    let pill = 7.0;
     let resp = ui
         .scope(|ui| {
             let w = &mut ui.visuals_mut().widgets;
@@ -523,10 +467,10 @@ pub fn field(ui: &mut Ui, value: &mut String, hint: &str, width: f32, lead: Opti
     let outer = resp.rect + margin;
     let focus = ui.ctx().animate_bool_with_time(resp.id.with("focus"), resp.has_focus(), 0.14);
     if focus > 0.0 {
-        ui.painter().rect_stroke(outer.expand(2.0), pill + 2.0, Stroke::new(3.0, PINK.gamma_multiply(0.35 * focus)));
+        ui.painter().rect_stroke(outer.expand(2.0), pill + 2.0, Stroke::new(3.0_f32, pink().gamma_multiply(0.35 * focus)));
     }
     if let Some(c) = lead {
-        let color = if resp.has_focus() { PINK } else { FAINT };
+        let color = if resp.has_focus() { pink() } else { faint() };
         ui.painter().text(pos2(outer.left() + 19.0, outer.center().y), Align2::CENTER_CENTER, c, glyphs(14.0), color);
     }
     resp
@@ -546,7 +490,7 @@ pub fn segmented(ui: &mut Ui, id_salt: &str, options: &[&str], selected: Option<
     };
     let total = widths.iter().sum::<f32>() + pad * 2.0;
     let (rect, _) = ui.allocate_exact_size(vec2(total, CONTROL_H), Sense::hover());
-    painter.rect(rect, rect.height() / 2.0, FIELD, Stroke::new(1.0, LINE));
+    painter.rect(rect, rect.height() / 2.0, deep(), Stroke::new(1.0_f32, line()));
     let mut x = rect.left() + pad;
     let cells: Vec<Rect> = widths
         .iter()
@@ -561,7 +505,7 @@ pub fn segmented(ui: &mut Ui, id_salt: &str, options: &[&str], selected: Option<
         let ax = ctx.animate_value_with_time(id.with("x"), cell.left() - rect.left(), 0.24);
         let aw = ctx.animate_value_with_time(id.with("w"), cell.width(), 0.24);
         let pill = Rect::from_min_size(pos2(rect.left() + ax, cell.top()), vec2(aw, cell.height()));
-        painter.rect(pill, pill.height() / 2.0, RAISED, Stroke::new(1.0, LINE_HI));
+        painter.rect(pill, pill.height() / 2.0, raised(), Stroke::new(1.0_f32, line_strong()));
     }
     let mut picked = None;
     for (i, (cell, g)) in cells.iter().zip(galleys).enumerate() {
@@ -569,9 +513,9 @@ pub fn segmented(ui: &mut Ui, id_salt: &str, options: &[&str], selected: Option<
         let on = selected == Some(i);
         let t = hover(ui, resp.id, resp.hovered());
         let at = cell.center() - g.size() / 2.0 + vec2(0.0, 1.0);
-        painter.galley(at, g, if on { WHITE } else { mix(MUTED, WHITE, t) });
+        painter.galley(at, g, if on { white() } else { mix(muted(), white(), t) });
         if resp.has_focus() {
-            painter.rect_stroke(cell.expand(1.0), cell.height() / 2.0, Stroke::new(2.0, PINK));
+            painter.rect_stroke(cell.expand(1.0), cell.height() / 2.0, Stroke::new(2.0_f32, pink()));
         }
         if resp.clicked() && !on {
             picked = Some(i);
@@ -580,47 +524,12 @@ pub fn segmented(ui: &mut Ui, id_salt: &str, options: &[&str], selected: Option<
     picked
 }
 
-/// Spaced-capital tabs on the sunset strip, with a plum line under the open
-/// one that slides to the next.
-pub fn tabs(ui: &mut Ui, id_salt: &str, options: &[&str], selected: usize) -> Option<usize> {
-    let id = Id::new(id_salt);
-    let painter = ui.painter().clone();
-    let h = ui.available_height();
-    let mut cells = Vec::new();
-    let mut picked = None;
-    for (i, label) in options.iter().enumerate() {
-        let g = caps_galley(&painter, label, 12.5, 0.16);
-        let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 26.0, h), Sense::click());
-        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-        let t = hover(ui, resp.id, resp.hovered());
-        let color = if i == selected { PLUM } else { PLUM.gamma_multiply(0.78 + 0.22 * t) };
-        let text_rect = Rect::from_center_size(rect.center() + vec2(0.0, 1.0), g.size());
-        painter.galley(text_rect.min, g, color);
-        if resp.has_focus() {
-            painter.rect_stroke(text_rect.expand2(vec2(9.0, 7.0)), R, Stroke::new(2.0, PLUM));
-        }
-        if resp.clicked() && i != selected {
-            picked = Some(i);
-        }
-        cells.push(rect);
-    }
-    if let (Some(first), Some(cell)) = (cells.first(), cells.get(selected)) {
-        let ctx = ui.ctx();
-        let x = ctx.animate_value_with_time(id.with("x"), cell.left() - first.left(), 0.24);
-        let w = ctx.animate_value_with_time(id.with("w"), cell.width(), 0.24);
-        let line = Rect::from_min_size(pos2(first.left() + x + 13.0, cell.bottom() - 12.0), vec2(w - 26.0, 2.0));
-        painter.rect_filled(line, 1.0, PLUM);
-    }
-    picked
-}
-
-/// A switch with its name and one line on what it does; the whole row toggles.
 pub fn toggle(ui: &mut Ui, on: &mut bool, title: &str, hint: &str) -> Response {
     let w = ui.available_width();
     let text_x = 54.0;
     let painter = ui.painter().clone();
-    let title_g = painter.layout_no_wrap(title.to_owned(), strong(14.0), WHITE);
-    let hint_g = painter.layout(hint.to_owned(), regular(13.0), FAINT, (w - text_x).max(80.0));
+    let title_g = painter.layout_no_wrap(title.to_owned(), strong(14.0), white());
+    let hint_g = painter.layout(hint.to_owned(), regular(13.0), faint(), (w - text_x).max(80.0));
     let h = title_g.size().y + 1.0 + hint_g.size().y;
     let (rect, mut resp) = ui.allocate_exact_size(vec2(w, h), Sense::click());
     if resp.clicked() {
@@ -630,14 +539,14 @@ pub fn toggle(ui: &mut Ui, on: &mut bool, title: &str, hint: &str) -> Response {
     let t_on = ui.ctx().animate_bool_with_time(resp.id.with("on"), *on, 0.18);
     let t = hover(ui, resp.id, resp.hovered());
     let track = Rect::from_min_size(pos2(rect.left(), rect.top() + 1.0), vec2(40.0, 22.0));
-    let off = mix(RAISED, RAISED_HI, t);
-    painter.rect(track, 11.0, mix(off, mix(PINK, PINK_HI, t), t_on), Stroke::new(1.0, mix(LINE_HI, PINK, t_on)));
+    let off = mix(raised(), mix(raised(), white(), 0.07), t);
+    painter.rect(track, 11.0, mix(off, mix(pink(), white(), t), t_on), Stroke::new(1.0_f32, mix(line_strong(), pink(), t_on)));
     let knob = egui::lerp((track.left() + 11.0)..=(track.right() - 11.0), t_on);
-    painter.circle_filled(pos2(knob, track.center().y), 8.0, mix(LILAC, PLUM, t_on));
-    painter.galley(pos2(rect.left() + text_x, rect.top()), title_g.clone(), WHITE);
-    painter.galley(pos2(rect.left() + text_x, rect.top() + title_g.size().y + 1.0), hint_g, FAINT);
+    painter.circle_filled(pos2(knob, track.center().y), 8.0, mix(lilac(), action_text(), t_on));
+    painter.galley(pos2(rect.left() + text_x, rect.top()), title_g.clone(), white());
+    painter.galley(pos2(rect.left() + text_x, rect.top() + title_g.size().y + 1.0), hint_g, faint());
     if resp.has_focus() {
-        painter.rect_stroke(track.expand(3.0), 14.0, Stroke::new(2.0, PINK));
+        painter.rect_stroke(track.expand(3.0), 14.0, Stroke::new(2.0_f32, pink()));
     }
     resp.on_hover_cursor(CursorIcon::PointingHand)
 }
@@ -647,7 +556,7 @@ pub fn badge(ui: &mut Ui, label: &str, color: Color32) -> Response {
     let painter = ui.painter().clone();
     let g = caps_galley(&painter, label, 10.0, 0.12);
     let (rect, resp) = ui.allocate_exact_size(vec2(g.size().x + 18.0, 22.0), Sense::hover());
-    painter.rect(rect, 11.0, color.gamma_multiply(0.12), Stroke::new(1.0, color.gamma_multiply(0.4)));
+    painter.rect(rect, 11.0, color.gamma_multiply(0.12), Stroke::new(1.0_f32, color.gamma_multiply(0.4)));
     painter.galley(rect.center() - g.size() / 2.0 + vec2(0.0, 1.0), g, color);
     resp
 }
@@ -659,12 +568,6 @@ pub fn dot(ui: &mut Ui, color: Color32) {
 }
 
 /// A short upright line between groups in a row.
-pub fn divider(ui: &mut Ui) {
-    ui.add_space(8.0);
-    let (r, _) = ui.allocate_exact_size(vec2(1.0, 16.0), Sense::hover());
-    ui.painter().vline(r.center().x, r.y_range(), Stroke::new(1.0, LINE_STRONG));
-    ui.add_space(8.0);
-}
 
 pub fn icon(ui: &mut Ui, c: char, size: f32, color: Color32) {
     if has_icons() {
@@ -675,7 +578,7 @@ pub fn icon(ui: &mut Ui, c: char, size: f32, color: Color32) {
 /// The one card: a panel lit a little at the top, with a fine border.
 pub fn card<R>(ui: &mut Ui, margin: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     let back = ui.painter().add(egui::Shape::Noop);
-    let resp = Frame::none().stroke(Stroke::new(1.0, LINE)).rounding(R_LG).inner_margin(Margin::same(margin)).show(ui, |ui| {
+    let resp = Frame::none().stroke(Stroke::new(1.0_f32, line())).rounding(R_LG).inner_margin(Margin::same(margin)).show(ui, |ui| {
         ui.set_width(ui.available_width());
         add(ui)
     });
@@ -683,24 +586,106 @@ pub fn card<R>(ui: &mut Ui, margin: f32, add: impl FnOnce(&mut Ui) -> R) -> R {
     resp.inner
 }
 
-/// A card's ground: the panel light, with the card's rounding.
-fn panel_shape(rect: Rect) -> egui::epaint::RectShape {
-    let mut shape = egui::epaint::RectShape::filled(rect, R_LG, Color32::WHITE);
-    match PANEL.get() {
-        Some(tex) => {
-            shape.fill_texture_id = tex.id();
-            shape.uv = Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-        }
-        None => shape.fill = SURFACE,
+// Blurred wallpaper in the same coordinate system as the workspace.
+thread_local!{
+    static WALL_GLASS:std::cell::Cell<Option<(egui::TextureId,Rect,Rect)>> = const {std::cell::Cell::new(None)};
+}
+pub fn set_wall_glass(wall:Option<(egui::TextureId,Rect,Rect)>){WALL_GLASS.set(wall);}
+const GLASS_OPACITY: u8 = 208;
+
+fn wallpaper_uv(point: Pos2, area: Rect, uv: Rect) -> Pos2 {
+    pos2(egui::remap(point.x, area.x_range(), uv.x_range()),
+         egui::remap(point.y, area.y_range(), uv.y_range()))
+}
+
+fn panel_shape(rect: Rect) -> egui::Shape {
+    glass_surface(rect, R_LG, surface())
+}
+
+/// One glass outline around the header and the shorter tab strip at its foot.
+pub fn profile_glass(header: Rect, tabs: Rect) -> egui::Shape {
+    let outer = header.union(tabs);
+    let radius = R_LG;
+    let shoulder = (header.right() - tabs.right() - radius).min(radius);
+    if shoulder < 1.0 {
+        return egui::Shape::Vec(vec![
+            panel_shape(outer),
+            egui::Shape::rect_stroke(outer, radius, Stroke::new(1.0_f32, line())),
+        ]);
     }
-    shape
+
+    let mut edge = Vec::new();
+    let mut arc = |cx: f32, cy: f32, r: f32, start: f32, end: f32| {
+        for step in 0..=8 {
+            let angle = (start + (end - start) * step as f32 / 8.0).to_radians();
+            edge.push(pos2(cx + r * angle.cos(), cy + r * angle.sin()));
+        }
+    };
+    arc(outer.left() + radius, outer.top() + radius, radius, 180.0, 270.0);
+    arc(header.right() - radius, outer.top() + radius, radius, 270.0, 360.0);
+    arc(header.right() - radius, header.bottom() - radius, radius, 0.0, 90.0);
+    arc(tabs.right() + shoulder, header.bottom() + shoulder, shoulder, 270.0, 180.0);
+    arc(tabs.right() - radius, outer.bottom() - radius, radius, 0.0, 90.0);
+    arc(outer.left() + radius, outer.bottom() - radius, radius, 90.0, 180.0);
+
+    // The overlap of the header and the tab strip can see the entire contour.
+    let center = pos2(tabs.center().x, header.center().y);
+    let mesh_layer = |color, wallpaper: Option<(egui::TextureId, Rect, Rect)>| {
+        let mut mesh = egui::Mesh::default();
+        if let Some((texture, _, _)) = wallpaper { mesh.texture_id = texture; }
+        for pos in std::iter::once(&center).chain(&edge) {
+            let uv = wallpaper.map_or(egui::epaint::WHITE_UV, |(_, area, uv)| wallpaper_uv(*pos, area, uv));
+            mesh.vertices.push(egui::epaint::Vertex { pos: *pos, uv, color });
+        }
+        for i in 0..edge.len() {
+            mesh.add_triangle(0, (1 + i) as u32, (1 + (i + 1) % edge.len()) as u32);
+        }
+        egui::Shape::mesh(mesh)
+    };
+    let mut layers = Vec::new();
+    let glass = PALETTE.get().1;
+    if let Some(wallpaper) = WALL_GLASS.get().filter(|_| glass) {
+        layers.push(mesh_layer(Color32::WHITE, Some(wallpaper)));
+    }
+    let tint = surface();
+    let alpha = if glass { GLASS_OPACITY } else { 255 };
+    layers.push(mesh_layer(Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), alpha), None));
+    if glass {
+        layers.push(mesh_layer(Color32::from_black_alpha((GLASS_DARKNESS.get() as f32 * 1.55).round() as u8), None));
+    }
+    layers.push(egui::Shape::closed_line(edge, Stroke::new(1.0_f32, line())));
+    egui::Shape::Vec(layers)
+}
+
+pub fn glass_surface(rect: Rect, radius: f32, tint: Color32) -> egui::Shape {
+    let mut layers=Vec::new();
+    if let Some((texture,area,uv))=WALL_GLASS.get().filter(|_|PALETTE.get().1){
+        let mut glass=egui::epaint::RectShape::filled(rect,radius,Color32::WHITE);
+        glass.fill_texture_id=texture;glass.uv=Rect::from_min_max(wallpaper_uv(rect.min,area,uv),wallpaper_uv(rect.max,area,uv));layers.push(glass.into());
+    }
+    let opacity = if PALETTE.get().1 { GLASS_OPACITY } else { 255 };
+    let fill = Color32::from_rgba_unmultiplied(tint.r(), tint.g(), tint.b(), opacity);
+    layers.push(egui::epaint::RectShape::filled(rect,radius,fill).into());
+    if PALETTE.get().1 {
+        let shade = (GLASS_DARKNESS.get() as f32 * 1.55).round() as u8;
+        layers.push(egui::epaint::RectShape::filled(rect, radius, Color32::from_black_alpha(shade)).into());
+    }
+    egui::Shape::Vec(layers)
+}
+
+pub fn glass_frame<R>(ui: &mut Ui, radius: f32, margin: f32, tint: Color32, content: impl FnOnce(&mut Ui) -> R) -> egui::InnerResponse<R> {
+    let back = ui.painter().add(egui::Shape::Noop);
+    let frame = Frame::none().stroke(Stroke::new(1.0_f32, line()))
+        .rounding(radius).inner_margin(margin).show(ui, content);
+    ui.painter().set(back, glass_surface(frame.response.rect, radius, tint));
+    frame
 }
 
 /// A tinted note: an icon in `tone`, then whatever `add` puts beside it.
 pub fn callout<R>(ui: &mut Ui, tone: Color32, icon_char: char, add: impl FnOnce(&mut Ui) -> R) -> R {
     Frame::none()
         .fill(tone.gamma_multiply(0.07))
-        .stroke(Stroke::new(1.0, tone.gamma_multiply(0.32)))
+        .stroke(Stroke::new(1.0_f32, tone.gamma_multiply(0.32)))
         .rounding(R)
         .inner_margin(Margin::symmetric(16.0, 12.0))
         .show(ui, |ui| {
@@ -730,16 +715,16 @@ pub fn stats(ui: &mut Ui, items: &[Stat]) {
     let h = 86.0;
     let (rect, _) = ui.allocate_exact_size(vec2(w, h), Sense::hover());
     let painter = ui.painter().clone();
-    fill(&painter, rect, R_LG, Fill::Panel, Color32::WHITE);
-    painter.rect_stroke(rect, R_LG, Stroke::new(1.0, LINE));
+    painter.add(panel_shape(rect));
+    painter.rect_stroke(rect, R_LG, Stroke::new(1.0_f32, line()));
     let cw = w / items.len().max(1) as f32;
     for (i, s) in items.iter().enumerate() {
         let cell = Rect::from_min_size(pos2(rect.left() + cw * i as f32, rect.top()), vec2(cw, h));
         if i > 0 {
-            painter.vline(cell.left(), (rect.top() + 18.0)..=(rect.bottom() - 18.0), Stroke::new(1.0, LINE_STRONG));
+            painter.vline(cell.left(), (rect.top() + 18.0)..=(rect.bottom() - 18.0), Stroke::new(1.0_f32, line_strong()));
         }
         let label = caps_galley(&painter, s.label, 10.5, 0.16);
-        painter.galley(pos2(cell.left() + 20.0, cell.top() + 17.0), label, LILAC);
+        painter.galley(pos2(cell.left() + 20.0, cell.top() + 17.0), label, lilac());
         let value = one_line(ui, &s.value.to_uppercase(), display(32.0), s.color, cw - 34.0);
         painter.galley(pos2(cell.left() + 20.0, cell.top() + 36.0), value, s.color);
         if let Some(tip) = s.tip {
@@ -750,24 +735,21 @@ pub fn stats(ui: &mut Ui, items: &[Stat]) {
 
 /// The bottom of a scrolled list fading into `ground`: there is more below.
 pub fn fade_bottom(painter: &egui::Painter, rect: Rect, ground: Color32) {
+    fade_edge(painter,rect,ground,false);
+}
+
+pub fn fade_edge(painter: &egui::Painter, rect: Rect, ground: Color32, top:bool) {
+    let (start,end)=if top{(ground,Color32::TRANSPARENT)}else{(Color32::TRANSPARENT,ground)};
     let mut mesh = egui::Mesh::default();
-    mesh.colored_vertex(rect.left_top(), Color32::TRANSPARENT);
-    mesh.colored_vertex(rect.right_top(), Color32::TRANSPARENT);
-    mesh.colored_vertex(rect.left_bottom(), ground);
-    mesh.colored_vertex(rect.right_bottom(), ground);
+    mesh.colored_vertex(rect.left_top(), start);
+    mesh.colored_vertex(rect.right_top(), start);
+    mesh.colored_vertex(rect.left_bottom(), end);
+    mesh.colored_vertex(rect.right_bottom(), end);
     mesh.add_triangle(0, 1, 2);
     mesh.add_triangle(1, 3, 2);
     painter.add(egui::Shape::mesh(mesh));
 }
 
-/// The sunset strip across `rect`.
-pub fn strip(painter: &egui::Painter, rect: Rect) {
-    fill(painter, rect, 0.0, Fill::Strip, Color32::WHITE);
-}
-
-/// A dialog over a dimmed window, opened at `opened_at` (it fades in and
-/// drops 8 px into place). Returns what `add` returns, and whether the
-/// player clicked outside it or pressed Escape.
 pub fn modal<R>(ctx: &egui::Context, id: &str, opened_at: f64, width: f32, add: impl FnOnce(&mut Ui) -> R) -> (R, bool) {
     let now = ctx.input(|i| i.time);
     let a = ease_out(((now - opened_at) / 0.2) as f32);
@@ -787,15 +769,17 @@ pub fn modal<R>(ctx: &egui::Context, id: &str, opened_at: f64, width: f32, add: 
         .inner;
     let inner = egui::Area::new(Id::new(id))
         .order(egui::Order::Tooltip)
+        .default_size(vec2(width+58.0,screen.height()-26.0))
         .anchor(Align2::CENTER_CENTER, vec2(0.0, -8.0 * (1.0 - a)))
         .show(ctx, |ui| {
             ui.set_opacity(a);
             // The shadow and the panel go under the contents: their places are kept first.
             let shadow_at = ui.painter().add(egui::Shape::Noop);
             let back = ui.painter().add(egui::Shape::Noop);
-            let resp = Frame::none().stroke(Stroke::new(1.0, LINE_STRONG)).rounding(R_LG).inner_margin(Margin::same(28.0)).show(ui, |ui| {
-                ui.set_width(width);
-                add(ui)
+            let resp = Frame::none().stroke(Stroke::new(1.0_f32, line_strong())).rounding(R_LG).inner_margin(Margin::same(28.0)).show(ui, |ui| {
+                ui.set_width(width.min(screen.width()-72.0));
+                ui.set_max_height((screen.height()-96.0).max(180.0));
+                egui::ScrollArea::vertical().id_salt(id).max_height((screen.height()-96.0).max(180.0)).auto_shrink([false,true]).show(ui,add).inner
             });
             let rect = resp.response.rect;
             ui.painter().set(shadow_at, shadow().as_shape(rect, R_LG));

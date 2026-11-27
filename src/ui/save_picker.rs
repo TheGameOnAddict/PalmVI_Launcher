@@ -3,7 +3,7 @@ use crate::save_zip;
 use crate::saves::{self, LaunchSave};
 use crate::theme::{self, glyph, Look, Size};
 use crate::{slug, workspace, Project};
-use eframe::egui::{self, vec2, Color32, RichText, Ui};
+use eframe::egui::{self, vec2, Ui};
 use std::fs;
 use std::path::PathBuf;
 
@@ -29,6 +29,7 @@ pub(super) enum Action {
 
 pub(crate) struct SavePicker {
     pub(crate) project: Project,
+    pub(super) settings_only:bool,
     tab: Tab,
     selected: usize,
     this_build: Vec<SaveOption>,
@@ -124,6 +125,7 @@ impl SavePicker {
         favorites.sort_by(|a, b| a.title.cmp(&b.title));
         Self {
             project,
+            settings_only:false,
             tab: Tab::ThisBuild,
             selected,
             this_build,
@@ -136,6 +138,19 @@ impl SavePicker {
             transfer_status: None,
             pending_delete: None,
         }
+    }
+
+    pub(super) fn choices(&self)->Vec<(String,String,LaunchSave)>{
+        [("This build",&self.this_build),("Favorites",&self.favorites),("Other builds",&self.other_builds)].into_iter().flat_map(|(group,items)|items.iter().map(move |s|(group.to_string(),s.title.clone(),s.choice.clone()))).collect()
+    }
+    pub(super) fn select(&mut self,choice:&LaunchSave){
+        for (tab,items) in [(Tab::ThisBuild,&self.this_build),(Tab::Favorites,&self.favorites),(Tab::OtherBuilds,&self.other_builds)]{
+            if let Some(i)=items.iter().position(|s|&s.choice==choice){self.selected=i;self.tab=tab;return;}
+        }
+    }
+    pub(super) fn selection_name(&self)->String{
+        let list=match self.tab{Tab::ThisBuild=>&self.this_build,Tab::Favorites=>&self.favorites,Tab::OtherBuilds=>&self.other_builds};
+        list.get(self.selected).map(|s|s.title.clone()).unwrap_or_default()
     }
 
     pub(super) fn show(
@@ -151,16 +166,16 @@ impl SavePicker {
                 ui,
                 screenshot_name.unwrap_or(&self.project.name),
                 11.5,
-                theme::LILAC,
+                theme::lilac(),
             );
-            theme::title(ui, "Choose a save", 40.0, 540.0);
+            theme::title(ui, "Choose a save", 30.0, 540.0);
             if let Some((name, path)) = &self.pending_delete {
                 wrapped(
                     ui,
                     &format!(
-                        "Delete {name}? The files will move to Mandyhub’s deleted-saves folder."
+                        "Delete {name}? The files will move to PalmVI’s deleted-saves folder."
                     ),
-                    theme::BLUSH,
+                    theme::blush(),
                 );
                 let mut confirm = false;
                 let mut cancel = false;
@@ -174,7 +189,9 @@ impl SavePicker {
                     match saves::delete_save(&workspace(), path) {
                         Ok(_) => {
                             let tab = self.tab;
+                            let settings=self.settings_only;
                             *self = Self::new(self.project.clone());
+                            self.settings_only=settings;
                             self.tab = tab;
                             self.transfer_status = Some(Ok("Save moved to deleted-saves.".into()));
                         }
@@ -263,10 +280,10 @@ impl SavePicker {
             let mut selected = self.selected;
             egui::ScrollArea::vertical()
                 .id_salt("save-list")
-                .max_height(170.0)
+                .max_height((ctx.screen_rect().height()*0.29).clamp(125.0,244.0))
                 .show(ui, |ui| {
                     if options.is_empty() {
-                        wrapped(ui, empty, theme::FAINT);
+                        wrapped(ui, empty, theme::faint());
                     }
                     for (index, option) in options.iter().enumerate() {
                         let alias = (screenshot && self.tab != Tab::ThisBuild)
@@ -274,6 +291,7 @@ impl SavePicker {
                         if save_row(
                             ui,
                             alias.as_deref().unwrap_or(&option.title),
+                            option.detail,
                             selected == index,
                         ) {
                             selected = index;
@@ -289,10 +307,7 @@ impl SavePicker {
             let source = options
                 .get(selected)
                 .and_then(|option| option.favorite_source.clone());
-            if let Some(option) = options.get(selected) {
-                ui.add_space(4.0);
-                note(ui, option.detail);
-            }
+
             let export_source = match &choice {
                 Some(LaunchSave::Copy(path)) => Some(path.as_path()),
                 _ => source.as_deref(),
@@ -310,7 +325,7 @@ impl SavePicker {
                     {
                         if let Some(destination) = rfd::FileDialog::new()
                             .add_filter("ZIP archive", &["zip"])
-                            .set_file_name("Mandyhub Save.zip")
+                            .set_file_name("PalmVI Save.zip")
                             .save_file()
                         {
                             let destination = if destination.extension().is_none() {
@@ -347,8 +362,8 @@ impl SavePicker {
             }
             if let Some(status) = &self.transfer_status {
                 match status {
-                    Ok(message) => wrapped(ui, message, theme::GOOD),
-                    Err(error) => wrapped(ui, error, theme::BAD),
+                    Ok(message) => wrapped(ui, message, theme::good()),
+                    Err(error) => wrapped(ui, error, theme::bad()),
                 }
             }
             if let (Some(name), Some(source)) = (&mut self.naming, &source) {
@@ -365,7 +380,7 @@ impl SavePicker {
                 }
                 let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if let Some(error) = &self.error {
-                    wrapped(ui, error, theme::BAD);
+                    wrapped(ui, error, theme::bad());
                 }
                 let mut action = Action::Keep;
                 button_row(ui, |ui| {
@@ -421,9 +436,9 @@ impl SavePicker {
                     ui,
                     Look::Primary,
                     Size::Normal,
-                    Some(glyph::PLAY),
-                    label,
-                    can_play && choice.is_some(),
+                    Some(if self.settings_only{glyph::CHECK}else{glyph::PLAY}),
+                    if self.settings_only{"Use this save"}else{label},
+                    (self.settings_only || can_play) && choice.is_some(),
                     false,
                 )
                 .clicked()
@@ -449,16 +464,18 @@ impl SavePicker {
     }
 }
 
-fn save_row(ui: &mut Ui, name: &str, selected: bool) -> bool {
-    let title = RichText::new(format!("{}  {}", if selected { "●" } else { "○" }, name))
-        .font(theme::regular(15.0))
-        .color(theme::WHITE);
-    let row = egui::Button::new(title)
-        .min_size(vec2(ui.available_width(), 34.0))
-        .fill(if selected {
-            theme::LINE_STRONG
-        } else {
-            Color32::TRANSPARENT
-        });
-    ui.add(row).clicked()
+fn save_row(ui:&mut Ui,name:&str,detail:&str,selected:bool)->bool{
+    let (r,b)=ui.allocate_exact_size(vec2(ui.available_width(),52.0),egui::Sense::click());
+    let accent=theme::lilac();
+    let fill=if selected{theme::mix(theme::surface(),accent,0.10)}else{theme::raised()};
+    ui.painter().rect(r,8.0,fill,egui::Stroke::new(1.0_f32,if selected||b.hovered(){accent}else{theme::line()}));
+    let dot=r.left_center()+vec2(17.0,0.0);
+    ui.painter().circle_stroke(dot,6.0,egui::Stroke::new(1.4_f32,if selected{accent}else{theme::muted()}));
+    if selected{ui.painter().circle_filled(dot,3.0,accent);}
+    let width=(r.width()-46.0).max(40.0);
+    let title=theme::one_line(ui,name,theme::strong(15.0),theme::white(),width);
+    let sub=theme::one_line(ui,detail,theme::regular(12.0),theme::muted(),width);
+    ui.painter().galley(r.min+vec2(35.0,7.0),title,theme::white());
+    ui.painter().galley(r.min+vec2(35.0,29.0),sub,theme::muted());
+    b.on_hover_cursor(egui::CursorIcon::PointingHand).clicked()
 }
