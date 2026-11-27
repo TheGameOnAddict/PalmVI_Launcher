@@ -329,7 +329,8 @@ pub(super) fn apply_to_profile(
     }
     let existing = if preset.repo_script.is_some() {
         presets.iter().position(|saved| {
-            saved.repo_script == preset.repo_script
+            (saved.repo_script == preset.repo_script || (saved.repo_script.as_deref() == Some("play-3070")
+                && preset.repo_script.as_deref() == Some("scarlet-fps") && preset.script_options.is_some_and(|o| o.scarlet_fps)))
                 && saved.projects.iter().any(|key| key == project_key)
         })
     } else {
@@ -347,6 +348,7 @@ pub(super) fn apply_to_profile(
                 }
                 if launch.switches.is_some() { launch.script_options = preset.script_options; }
             }
+            saved.repo_script.clone_from(&preset.repo_script);
             saved.switches = preset.switches.clone();
             saved.args.clone_from(&preset.args);
             saved.script_options = preset.script_options;
@@ -446,7 +448,7 @@ pub(super) fn show_script_options(
             }
         }
         if options.probe_rays {
-            let mut probe_rays = !ray_tracing && enabled(switches, probe_keys);
+            let mut probe_rays = !ray_tracing && enabled(switches, if options.scarlet_fps { &["VICTORY_PROBE_RAYS"] } else { probe_keys });
             if ui
                 .add_enabled(
                     !ray_tracing,

@@ -16,6 +16,7 @@ impl App {
         let standalone = p.runs_standalone();
         let graphics = self.saved.graphics_for(&p.repo);
         let launch = self.saved.project_launch.get(&key);
+        let script_graphics = launch.is_some_and(crate::ProjectLaunch::uses_scarlet_fps);
         let inherited = launch.is_none_or(|s| s.graphics.is_none());
         let method = crate::LaunchMethod::for_project(p, crate::nvidia_rt::supported(&crate::project_script_root(p)));
         let active = launch.and_then(|profile| self.saved.launch_presets.iter().find(|s| Some(&s.name) == profile.selected_preset.as_ref()));
@@ -37,7 +38,7 @@ impl App {
                     .map_or("Custom", |i| MODES[i].0)
                     .to_string(),
                 if inherited {
-                    "Using global settings"
+                    if script_graphics { "Using script defaults" } else { "Using global settings" }
                 } else {
                     "Project override"
                 },
@@ -81,7 +82,7 @@ impl App {
                         }
                         1=>{
                             let launch=self.saved.project_launch.entry(key.clone()).or_default();
-                            if ui.selectable_label(inherited,"Use global settings").clicked(){launch.graphics=None;ui.memory_mut(|m|m.close_popup());}
+                            if ui.selectable_label(inherited,if script_graphics { "Use script defaults" } else { "Use global settings" }).clicked(){launch.graphics=None;ui.memory_mut(|m|m.close_popup());}
                             for (i,(label,series_s,scale,_)) in MODES.iter().enumerate(){
                                 if ui.selectable_label(!inherited&&graphics_mode(graphics)==Some(i),*label).clicked(){launch.graphics=Some(GraphicsSettings{series_s:*series_s,render_scale:*scale,..graphics});ui.memory_mut(|m|m.close_popup());}
                             }

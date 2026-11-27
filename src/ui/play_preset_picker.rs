@@ -84,6 +84,10 @@ impl PlayPresetPicker {
         if let Some(script) = picker.previous_script(saved, launch) {
             // A removed script leaves "Keep current values" selected until the player chooses a replacement.
             picker.selected = picker.options.iter().position(|p| p.repo_script.as_deref() == Some(script));
+            if picker.selected.is_none() && script == "play-3070"
+                && folder.parent().and_then(crate::documented_scarlet_script) == Some("scarlet-fps") {
+                picker.selected = picker.options.iter().position(|p| p.repo_script.as_deref() == Some("scarlet-fps"));
+            }
             if picker.selected.is_none() { picker.missing_script = Some(script.to_owned()); }
         } else if let Some(name) = launch.and_then(|l| l.selected_preset.as_deref()) {
             picker.selected = picker.options.iter().position(|p| p.repo_script.is_none() && p.name == name);
@@ -215,7 +219,7 @@ fn choice_card(ui: &mut egui::Ui, title: &str, detail: &str, selected: bool) -> 
 }
 
 fn is_custom_script(stem: &str) -> bool {
-    stem.to_ascii_lowercase().starts_with("play-") && stem.len() > "play-".len()
+    stem.eq_ignore_ascii_case("scarlet-fps") || stem.to_ascii_lowercase().starts_with("play-") && stem.len() > "play-".len()
 }
 
 fn scripts(folder: &Path, project_name: &str) -> Vec<LaunchPreset> {
@@ -256,6 +260,7 @@ fn scripts(folder: &Path, project_name: &str) -> Vec<LaunchPreset> {
             }
         }
     }
+    let documented = folder.parent().and_then(crate::documented_scarlet_script);
     files.sort_by_key(|path| {
         let stem = path
             .file_stem()
@@ -269,7 +274,7 @@ fn scripts(folder: &Path, project_name: &str) -> Vec<LaunchPreset> {
         } else {
             2
         };
-        (targets.len() != 1 || !targets.contains(&stem), rank, stem)
+        (documented != Some(stem.as_str()), targets.len() != 1 || !targets.contains(&stem), rank, stem)
     });
     files
         .iter()
@@ -305,6 +310,17 @@ fn prefills_the_matching_custom_script_ahead_of_the_standard_script() {
     let wrapper = root.join("Play.cmd");
     std::fs::write(&wrapper, r#"powershell -NoProfile -File "%~dp0scripts\play-alt.ps1""#).unwrap();
     assert_eq!(scripts(&folder, "victory-scarlett")[0].name, "play-alt");
+    for stem in ["play-3070", "scarlet-fps"] {
+        let script = folder.join(format!("{stem}.ps1"));
+        std::fs::write(&script, valid).unwrap();
+        std::fs::write(root.join("README.md"), format!("cargo build --release --bin victory\npowershell -File .\\scripts\\{stem}.ps1 -Game example")).unwrap();
+        std::fs::write(root.join("Cargo.toml"), "[profile.diag]").unwrap();
+        assert_eq!(scripts(&folder, "fixture")[0].name, stem);
+        assert_eq!(crate::detect_build_profile(&root), "release");
+        std::fs::remove_file(script).unwrap();
+    }
+    std::fs::remove_file(root.join("README.md")).unwrap();
+    std::fs::remove_file(root.join("Cargo.toml")).unwrap();
     std::fs::remove_file(wrapper).unwrap();
     for (name, _) in fixtures {
         std::fs::remove_file(folder.join(name)).unwrap();

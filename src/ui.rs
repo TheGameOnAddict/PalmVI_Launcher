@@ -611,16 +611,16 @@ impl App {
     }
 
     fn project_graphics_menu(&mut self, ui: &mut Ui, project: &Project) {
-        let default_graphics = self.saved.default_graphics();
+        let default_graphics = self.saved.graphics_base(&project.repo);
         let key = project_key(&project.repo);
         let launch = self.saved.project_launch.entry(key).or_default();
         ui.heading("Graphics preset");
-        note(ui,if launch.graphics.is_some(){"Overrides global settings"}else{"Using global settings"});
+        note(ui,if launch.graphics.is_some(){"Project override"}else if launch.uses_scarlet_fps(){"Using script defaults"}else{"Using global settings"});
         let mut graphics=launch.graphics.unwrap_or(default_graphics);
         let before=graphics;
         graphics_controls(ui,&mut graphics,crate::nvidia_rt::supported(&crate::project_script_root(project)));
         if before!=graphics{launch.graphics=Some(graphics);}
-        if launch.graphics.is_some() && ui.button("Use global settings").clicked(){launch.graphics=None;}
+        if launch.graphics.is_some() && ui.button(if launch.uses_scarlet_fps(){"Use script defaults"}else{"Use global settings"}).clicked(){launch.graphics=None;}
     }
 
     fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {

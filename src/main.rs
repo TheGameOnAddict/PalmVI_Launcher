@@ -214,6 +214,8 @@ struct ProjectLaunch {
 }
 
 impl ProjectLaunch {
+    fn uses_scarlet_fps(&self) -> bool { self.switches.is_some() && self.script_options.is_some_and(|o| o.scarlet_fps) }
+
     fn scripts_need_review(&self, installed: Option<&str>) -> bool {
         matches!((self.reviewed_script_revision.as_deref(), installed), (Some(old), Some(new)) if old != new)
     }
@@ -301,6 +303,9 @@ impl Saved {
             scale: graphics.render_scale,
             output: graphics.output,
             extra,
+            scarlet_fps: settings.is_some_and(ProjectLaunch::uses_scarlet_fps),
+            foxhound_defaults: settings.is_some_and(|s| s.switches.is_some() && s.script_options.is_some_and(|o| o.foxhound)),
+            graphics_override: settings.is_some_and(|p| p.graphics.is_some()),
             use_script_defaults: settings.is_some_and(|s| s.switches.is_some() && s.script_options.is_some()),
             scarlett_shader_pass: scarlett_shader_pass || settings.and_then(|s| s.script_options).is_some_and(|options| options.shader_pass),
             fullscreen: graphics.fullscreen,
@@ -321,12 +326,17 @@ impl Saved {
             launch.selected_preset.as_ref() == Some(&p.name) && p.projects.contains(&key) && p.repo_script.is_some()
         ) else { return Ok(None) };
         let (Some(name), Some(profile), Some(previous)) =
-            (&preset.repo_script, &mut launch.switches, &mut preset.switches) else { return Ok(None) };
-        if !name.eq_ignore_ascii_case("play") && !name.to_ascii_lowercase().starts_with("play-")
+            (&mut preset.repo_script, &mut launch.switches, &mut preset.switches) else { return Ok(None) };
+        if !name.eq_ignore_ascii_case("play") && !name.eq_ignore_ascii_case("scarlet-fps") && !name.to_ascii_lowercase().starts_with("play-")
             || name.contains(['/', '\\', ':']) {
             return Err("Invalid repository script name".into());
         }
-        let path = project_script_root(project).join("scripts").join(format!("{name}.ps1"));
+        let root = project_script_root(project);
+        if name == "play-3070" && !root.join("scripts/play-3070.ps1").is_file()
+            && documented_scarlet_script(&root) == Some("scarlet-fps") {
+            *name = "scarlet-fps".into();
+        }
+        let path = root.join("scripts").join(format!("{name}.ps1"));
         let source = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let (current, options) = script_preset::parse(&source)?;
         if *previous != current {
@@ -349,10 +359,22 @@ impl Saved {
         }
     }
 
+    fn graphics_base(&self, repo: &str) -> GraphicsSettings {
+        let mut base = self.default_graphics();
+        if self.project_launch.get(&project_key(repo)).is_some_and(ProjectLaunch::uses_scarlet_fps) {
+            base.series_s = true;
+            base.render_scale = 1.0;
+            base.output = OutputResolution::Default;
+            base.fix_8gb = false;
+            base.bright_shadows = false;
+        }
+        base
+    }
+
     fn graphics_for(&self, repo: &str) -> GraphicsSettings {
         self.project_launch.get(&project_key(repo))
             .and_then(|project| project.graphics)
-            .unwrap_or_else(|| self.default_graphics())
+            .unwrap_or_else(|| self.graphics_base(repo))
     }
 
     fn launch_overrides(&self, repo: &str) -> (Vec<String>, String) {
@@ -489,6 +511,9 @@ struct Launch {
     /// `VICTORY_*` lines: the player's switches and the graphics fixes.
     extra: String,
     use_script_defaults: bool,
+    scarlet_fps: bool,
+    foxhound_defaults: bool,
+    graphics_override: bool,
     scarlett_shader_pass: bool,
     fullscreen: bool,
     warm_first: bool,
@@ -761,6 +786,10 @@ fn built_exe(repo: &str) -> PathBuf {
     let target = target_dir(repo);
     let executable = target.join(detect_build_profile(&workspace)).join("victory.exe");
     let previous = target.join("release").join("victory.exe");
+    if !executable.is_file() && (documented_scarlet_script(&workspace).is_some() || nvidia_rt::has_overlay_player(&workspace)) {
+        let legacy = target.join("diag/victory.exe");
+        if legacy.is_file() { return legacy; }
+    }
     if workspace != dir && !executable.is_file() && previous.is_file() {
         return previous;
     }
@@ -814,9 +843,23 @@ fn finds_a_unique_nested_victory_workspace_and_prefers_the_root() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// These forks document their release launcher in the README. Older checkouts
+/// also contain a CMD inherited from a different configuration.
+fn documented_scarlet_script(root: &Path) -> Option<&'static str> {
+    let scripts = root.join("scripts");
+    let candidates = ["scarlet-fps", "play-3070"];
+    if !candidates.iter().any(|stem| scripts.join(format!("{stem}.ps1")).is_file()) { return None; }
+    let readme = std::fs::read_to_string(root.join("README.md")).ok()?.to_ascii_lowercase().replace('/', "\\");
+    if !readme.lines().any(|l| l.trim() == "cargo build --release --bin victory") { return None; }
+    candidates.into_iter().find(|stem| scripts.join(format!("{stem}.ps1")).is_file() && readme.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("powershell ") && line.split_whitespace().any(|arg| arg == format!(".\\scripts\\{stem}.ps1"))
+    }))
+}
+
 /// Checks a cloned repo's Cargo.toml for a custom build profile (e.g. `diag`).
 fn detect_build_profile(repo_dir: &Path) -> &'static str {
-    if nvidia_rt::supported(repo_dir) { return "release"; }
+    if nvidia_rt::supported(repo_dir) || nvidia_rt::has_overlay_player(repo_dir) || documented_scarlet_script(repo_dir).is_some() { return "release"; }
     let cargo_toml = repo_dir.join("Cargo.toml");
     if let Ok(text) = std::fs::read_to_string(&cargo_toml) {
         if text.contains("[profile.diag]") {
@@ -1576,6 +1619,7 @@ fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &
     cargo.current_dir(&workspace);
     if victory {
         cargo.args(["-p", "victory"]);
+        if documented_scarlet_script(&workspace).is_some() { cargo.args(["--bin", "victory"]); }
         if nvidia_rt::supported(&workspace) && nvidia_rt::needs_agility()? {
             stage(job, ctx, "Preparing Microsoft D3D12 Agility for the Windows 10 build");
             nvidia_rt::install_agility(&target.join(profile))?;
@@ -1672,9 +1716,10 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
     } else if let Some(parent) = p.local_exe.as_deref().and_then(|exe| Path::new(exe).parent()).filter(|p| p.is_dir()) {
         c.current_dir(parent);
     }
-    if l.scarlett_shader_pass {
+    if l.scarlett_shader_pass || l.scarlet_fps {
         for (key, _) in std::env::vars_os() {
-            if key.to_string_lossy().to_ascii_uppercase().starts_with("VICTORY_") {
+            let upper = key.to_string_lossy().to_ascii_uppercase();
+            if upper.starts_with("VICTORY_") && !(l.scarlet_fps && upper == "VICTORY_CONFIG") {
                 c.env_remove(key);
             }
         }
@@ -1685,7 +1730,7 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
             c.env(&k, &v);
         }
     }
-    if l.series_s {
+    if l.series_s && (!l.scarlet_fps || l.graphics_override) {
         c.env("VICTORY_OWN_UPSCALER", "1");
         c.env("VICTORY_RENDER_SCALE", format!("{:.2}", l.scale));
     }
@@ -1704,6 +1749,26 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
             }
         }
     }
+    if l.scarlet_fps {
+        let rays = script_preset::enabled(&l.extra, script_preset::RAY_TRACING);
+        let probes = !rays && script_preset::enabled(&l.extra, &["VICTORY_PROBE_RAYS"]);
+        // The script sets only the active branch. Some runtime flags use key presence.
+        for (keys, on) in [
+            (script_preset::RAY_TRACING, rays),
+            (&["VICTORY_PROBE_RAYS", "VICTORY_PLANE_NOW"][..], probes),
+            (&["VICTORY_AMBIENT", "VICTORY_AMBIENT_AIR", "VICTORY_AMBIENT_SPECULAR"][..], !rays && !probes),
+        ] {
+            for key in keys {
+                if !on { c.env_remove(key); }
+                else if probes && *key == "VICTORY_PLANE_NOW" { c.env(key, "1"); }
+            }
+        }
+        for key in script_preset::HOOKS {
+            if l.extra.lines().rev().filter_map(|line| line.split_once('=')).find(|(k,_)| k.trim()==*key).is_some_and(|(_,v)| v.trim()=="0") {
+                c.env_remove(key);
+            }
+        }
+    }
 }
 
 fn child_command(base: &Command) -> Command {
@@ -1714,6 +1779,8 @@ fn child_command(base: &Command) -> Command {
     }
     command
 }
+
+fn supports_flag(help: &str, flag: &str) -> bool { help.split_whitespace().any(|word| word == flag) }
 
 fn victory_help(base: &Command, subcommand: &str) -> Option<String> {
     let mut command = child_command(base);
@@ -1784,16 +1851,17 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, base: &Command, l: &Launch) 
     stage(job, ctx, "Warming up shaders (checking build support)");
     prepare_launch_folders(base)?;
     let files: Vec<PathBuf> = WARM_FILES.iter().map(|f| l.game_dir.join(f)).filter(|f| f.is_file()).collect();
-    if files.is_empty() {
+    if files.is_empty() && !l.scarlet_fps {
         return Err("the game files were not found: choose their folder in Settings".into());
     }
-    let translate = if l.scarlett_shader_pass { None } else { victory_help(base, "translate") };
-    let supports_flag = |help: &str, flag: &str| help.split_whitespace().any(|word| word == flag);
+    let translate = if l.scarlett_shader_pass || l.scarlet_fps { None } else { victory_help(base, "translate") };
     let translate_cache = translate.as_deref().filter(|help| supports_flag(help, "--cache"));
     let mut commands = Vec::new();
     let mut shaders = child_command(base);
     let mut stamp = None;
-    if l.scarlett_shader_pass {
+    if l.scarlet_fps {
+        shaders.arg("shaders").arg(&l.game_dir);
+    } else if l.scarlett_shader_pass {
         let rpf = l.game_dir.join("shaders.rpf");
         if !rpf.is_file() { return Err(format!("Shader archive missing: {}", rpf.display())); }
         stamp = shader_stamp(base, &rpf);
@@ -1824,7 +1892,11 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, base: &Command, l: &Launch) 
         "Shader warm-up completed".to_owned()
     };
     if l.pipelines && !combined_pipelines {
-        if let Some(help) = victory_help(base, "warm") {
+        if l.scarlet_fps {
+            let mut pipelines = child_command(base);
+            pipelines.arg("warm");
+            commands.push(pipelines);
+        } else if let Some(help) = victory_help(base, "warm") {
             let mut pipelines = child_command(base);
             pipelines.arg("warm");
             if supports_flag(&help, "--used") { pipelines.arg("--used"); }
@@ -1922,14 +1994,16 @@ fn warm(job: &Arc<Mutex<Job>>, ctx: &egui::Context, base: &Command, l: &Launch) 
 /// Starts the installed build of `p`, warming its shaders first when the player asked for that.
 fn game_command(exe: &Path, p: &Project, l: &Launch) -> Result<Command, String> {
     let root = project_script_root(p);
-    if nvidia_rt::supported(&root) {
+    let packaged_overlay = (p.archive_exe.is_some() || (p.local_exe.is_some() && p.name.to_ascii_lowercase().contains("nvidia"))) && victory_help(&Command::new(exe), "play")
+        .is_some_and(|help| ["--series-s", "--dlss", "--set", "--no-framegen-ready", "--res"].iter().all(|flag| supports_flag(&help, flag)));
+    if nvidia_rt::supported(&root) || nvidia_rt::has_overlay_player(&root) || packaged_overlay {
         return nvidia_rt::command(exe, &root, &p.repo, l);
     }
     let mut c = Command::new(exe);
     c.arg("run").arg(l.game_dir.join(EXE_NAME)).arg("--execute");
     let explicit_console = l.args.iter().take_while(|arg| arg.as_str() != "--")
         .any(|arg| arg == "--console" || arg.starts_with("--console="));
-    if !explicit_console && (l.series_s || l.output != OutputResolution::Default) {
+    if !explicit_console && (l.scarlet_fps || l.series_s || l.output != OutputResolution::Default) {
         c.args(["--console", if l.series_s { "series-s" } else { "series-x" }]);
     }
     c.args(&l.args);
@@ -1998,7 +2072,7 @@ fn play(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, l: &Launch, cho
         job.log.report(format!("Configured graphics profile: {}", if l.series_s { "Series S" } else { "Series X" }));
         if args.first().is_some_and(|arg| *arg == "play") {
             job.log.report(format!("Native NVIDIA play mode ({}). Saved F1 choices can override console, resolution, DLSS and frame cap.",
-                if l.nvidia_plain { "Plain" } else { "installed PLAY.cmd Fast settings" }));
+                if !nvidia_rt::supported(&project_script_root(p)) { "upstream defaults" } else if l.nvidia_plain { "Plain" } else { "installed PLAY.cmd Fast settings" }));
         } else {
             job.log.report(format!("Console passed to VIctory: {}", console.unwrap_or("build default (no --console argument)")));
             job.log.report(format!("Configured render scale: {:.0}%", l.scale * 100.0));

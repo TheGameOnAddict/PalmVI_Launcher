@@ -86,6 +86,13 @@ pub(super) fn supported(root: &Path) -> bool {
         && root.join("apps/victory/src/play.rs").is_file()
 }
 
+/// NVIDIA's original fork ships the F1-aware native command without Kemerd's Fast wrapper.
+pub(super) fn has_overlay_player(root: &Path) -> bool {
+    root.join("Get-NVIDIA-DLSS.cmd").is_file()
+        && root.join("scripts/play-foxhound.ps1").is_file()
+        && root.join("apps/victory/src/play.rs").is_file()
+}
+
 // Read only the literal --set pairs from the upstream recommended Fast preset.
 // No batch commands or substitutions are evaluated.
 fn fast_switches(script: &str) -> Result<BTreeMap<String, String>, String> {
@@ -131,24 +138,18 @@ pub(super) fn command(
     repo: &str,
     launch: &Launch,
 ) -> Result<Command, String> {
-    let script = std::fs::read_to_string(root.join("PLAY.cmd"))
-        .map_err(|e| format!("Reading PLAY.cmd: {e}"))?;
-    let mut settings = if launch.nvidia_plain {
-        BTreeMap::new()
-    } else {
-        fast_switches(&script)?
-    };
-    for (key, value) in [
-        ("VICTORY_PIPELINE_SAMPLER_TABLE", "1"),
-        ("VICTORY_HDR", "0"),
-        ("VICTORY_REFLEX", "boost"),
-        (
-            "VICTORY_FULLSCREEN",
-            if launch.fullscreen { "1" } else { "0" },
-        ),
-    ] {
-        settings.insert(key.into(), value.into());
+    let mut settings = BTreeMap::new();
+    if supported(root) {
+        if !launch.nvidia_plain {
+            let script = std::fs::read_to_string(root.join("PLAY.cmd"))
+                .map_err(|e| format!("Reading PLAY.cmd: {e}"))?;
+            settings = fast_switches(&script)?;
+        }
+        for (key, value) in [("VICTORY_PIPELINE_SAMPLER_TABLE", "1"), ("VICTORY_HDR", "0"), ("VICTORY_REFLEX", "boost")] {
+            settings.insert(key.into(), value.into());
+        }
     }
+    settings.insert("VICTORY_FULLSCREEN".into(), if launch.fullscreen { "1" } else { "0" }.into());
     let mut cmd = Command::new(exe);
     cmd.current_dir(root)
         .stdin(Stdio::null())
@@ -167,7 +168,7 @@ pub(super) fn command(
             .iter()
             .any(|arg| arg.split('=').next() == Some(flag))
     };
-    if launch.series_s && !has("--series-s") {
+    if launch.series_s && !has("--series-s") && !has("--console") {
         cmd.arg("--series-s");
     }
     if !has("--res") {
@@ -185,10 +186,19 @@ pub(super) fn command(
     {
         cmd.env("VICTORY_STREAMLINE_DIR", sdk);
     }
+    // Native play supplies the script baseline before reading F1 choices. Only
+    // locally changed values belong in --set, which takes priority over F1.
+    let script_defaults = if launch.foxhound_defaults && has_overlay_player(root) {
+        let source = std::fs::read_to_string(root.join("scripts/play-foxhound.ps1")).map_err(|e| e.to_string())?;
+        crate::script_preset::parse(&source)?.0
+    } else {
+        String::new()
+    };
+    let defaults: BTreeMap<_, _> = script_defaults.lines().filter_map(|line| line.split_once('=')).collect();
     for line in launch.extra.lines() {
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
-            if key.starts_with("VICTORY_") {
+            if key.starts_with("VICTORY_") && defaults.get(key).copied() != Some(value.trim()) {
                 settings.insert(key.into(), value.trim().into());
             }
         }
@@ -198,6 +208,15 @@ pub(super) fn command(
     let mut native_args = Vec::new();
     let mut args = launch.args.iter();
     while let Some(arg) = args.next() {
+        if arg == "--console" || arg.starts_with("--console=") {
+            let console = arg.strip_prefix("--console=").or_else(|| args.next().map(String::as_str));
+            match console {
+                Some("series-s") if !has("--series-s") => native_args.push("--series-s"),
+                Some("series-x" | "series-s") => {}
+                _ => return Err("Expected --console series-s or series-x.".into()),
+            }
+            continue;
+        }
         let value = if arg == "--set" {
             Some(
                 args.next()
@@ -220,7 +239,7 @@ pub(super) fn command(
             }
             settings.insert(key.into(), value.into());
         } else {
-            native_args.push(arg);
+            native_args.push(arg.as_str());
         }
     }
     for (key, value) in settings {
@@ -231,6 +250,7 @@ pub(super) fn command(
                 | "VICTORY_GAME_DIR"
                 | "VICTORY_CACHE_DIR"
                 | "VICTORY_DATA_DIR"
+                | "VICTORY_FIDELITYFX_DIR"
                 | "VICTORY_STREAMLINE_DIR"
                 | "VICTORY_LOG"
         ) {
@@ -244,6 +264,78 @@ pub(super) fn command(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn original_nvidia_source_uses_native_play_without_the_fast_wrapper() {
+        let root = std::env::temp_dir().join(format!("palmvi-overlay-source-{}", std::process::id()));
+        for folder in ["scripts", "apps/victory/src"] { std::fs::create_dir_all(root.join(folder)).unwrap(); }
+        for marker in ["Get-NVIDIA-DLSS.cmd", "apps/victory/src/play.rs", "scripts/play-foxhound.ps1"] {
+            std::fs::write(root.join(marker), []).unwrap();
+        }
+        let p = crate::Project { name: "Overlay fixture".into(), repo: "local/overlay-test".into(), branch: None,
+            gpu: vec![], fps: None, render: None, verified: false, summary: String::new(), custom: true,
+            local_exe: Some(root.join("victory.exe").display().to_string()), archive_exe: None };
+        let mut l = crate::Saved::default().launch(&p.repo, false);
+        l.args = vec!["--console".into(), "series-s".into(), "--dlss".into(), "balanced".into()];
+        let command = crate::game_command(&root.join("victory.exe"), &p, &l).unwrap();
+        let args: Vec<_> = command.get_args().map(|s| s.to_string_lossy()).collect();
+        assert_eq!(args[0], "play");
+        assert!(args.iter().any(|s| s == "--series-s"));
+        assert!(args.iter().any(|s| s == "balanced"));
+        assert!(!args.iter().any(|s| s.contains("VICTORY_REFLEX") || s == "--console"));
+        assert_eq!(crate::detect_build_profile(&root), "release");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "set PALMVI_TEST_OVERLAY_EXE to the reviewed NVIDIA executable"]
+    fn native_overlay_reads_saved_dlss_on_the_next_start() {
+        let exe = std::path::absolute(std::env::var_os("PALMVI_TEST_OVERLAY_EXE").unwrap()).unwrap();
+        let scratch = std::env::temp_dir().join(format!("palmvi overlay reload {}", std::process::id()));
+        let game = scratch.join("game");
+        let sdk = scratch.join("sdk");
+        std::fs::create_dir_all(&game).unwrap();
+        std::fs::create_dir_all(&sdk).unwrap();
+        std::fs::write(game.join(EXE_NAME), []).unwrap();
+        // Native settings resolution checks SDK presence before attempting to load the empty title.
+        std::fs::write(sdk.join("sl.interposer.dll"), []).unwrap();
+        let p = crate::Project { name: "NVIDIA packaged fixture".into(), repo: "local/nvidia-f1-reload".into(), branch: None,
+            gpu: vec![], fps: None, render: None, verified: false, summary: String::new(), custom: true,
+            local_exe: Some(exe.display().to_string()), archive_exe: None };
+        let mut launch = crate::Saved::default().launch(&p.repo, false);
+        launch.game_dir = game;
+        launch.args = vec!["--dlss".into(), "quality".into()];
+        assert_eq!(crate::game_command(&exe, &p, &launch).unwrap().get_args().next().unwrap(), "play");
+        let root = exe.parent().unwrap().parent().unwrap().parent().unwrap();
+        let source = std::fs::read_to_string(root.join("scripts/play-foxhound.ps1")).unwrap();
+        let (defaults, options) = crate::script_preset::parse(&source).unwrap();
+        assert!(options.foxhound);
+        let mut saved = crate::Saved::default();
+        saved.game_dir = launch.game_dir.display().to_string();
+        saved.project_launch.insert(p.repo.clone(), crate::ProjectLaunch {
+            switches: Some(format!("{defaults}\nVICTORY_WC_NO_BACK_MIN_KB=1536")), script_options: Some(options),
+            args: Some("--dlss quality".into()), ..Default::default() });
+        launch = saved.launch(&p.repo, false);
+        let p = crate::Project { local_exe: Some(root.join("victory.exe").display().to_string()), ..p };
+        let menu = scratch.join("victory").join("victory-settings.txt");
+        for expected in ["quality", "balanced"] {
+            let mut cmd = crate::game_command(&exe, &p, &launch).unwrap();
+            assert_eq!(cmd.get_args().next().unwrap(), "play");
+            let result = cmd.env("LOCALAPPDATA", &scratch).env("VICTORY_STREAMLINE_DIR", &sdk)
+                .env("VICTORY_DATA_DIR", scratch.join("save")).env("VICTORY_CACHE_DIR", scratch.join("cache")).output().unwrap();
+            assert!(!result.status.success(), "empty test title should fail to load");
+            let log = std::fs::read_dir(scratch.join("victory/logs")).unwrap().flatten()
+                .find(|f| f.path().extension().is_some_and(|ext| ext == "log")).unwrap().path();
+            let text = std::fs::read_to_string(&log).unwrap();
+            assert!(text.contains(&format!("VICTORY_MENU_FILE={}", menu.display())), "{text}");
+            assert!(text.contains(&format!("VICTORY_DLSS_MODE={expected}")), "{text}");
+            assert!(text.contains("VICTORY_WC_NO_BACK_MIN_KB=1536"));
+            if expected == "balanced" { assert!(text.contains("VICTORY_AMBIENT=0.5")); }
+            std::fs::remove_file(log).unwrap();
+            std::fs::write(&menu, "VICTORY_MENU_DLSS=balanced\r\nVICTORY_AMBIENT=0.5\r\n").unwrap();
+        }
+        std::fs::remove_dir_all(scratch).unwrap();
+    }
 
     #[test]
     fn reads_only_fast_literal_pairs() {

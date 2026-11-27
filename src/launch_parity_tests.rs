@@ -34,6 +34,79 @@ fn global_warmup_and_play_share_the_launch_context() {
     check_launch(None);
 }
 
+/// Execute a locally reviewed upstream script against a recorder instead of a game.
+#[test]
+#[ignore = "set PALMVI_TEST_FPS_SCRIPT to a trusted local Scarlet-FPS or 3070 script"]
+fn compare_3070_script_with_play() {
+    let source = fs::read(std::env::var_os("PALMVI_TEST_FPS_SCRIPT").expect("script path")).unwrap();
+    let root = std::env::temp_dir().join(format!("palmvi 3070 parity {}", std::process::id()));
+    let game = root.join("game files");
+    let release = root.join("target/release");
+    let scripts = root.join("scripts");
+    for folder in [&game, &release, &scripts] { fs::create_dir_all(folder).unwrap(); }
+    let script = scripts.join("scarlet-fps.ps1");
+    fs::write(&script, &source).unwrap();
+    let (defaults, options) = script_preset::parse(std::str::from_utf8(&source).unwrap()).unwrap();
+    assert!(options.scarlet_fps && options.hooks && options.ray_tracing && options.probe_rays);
+    fs::write(game.join(EXE_NAME), []).unwrap();
+    fs::write(game.join("shaders.rpf"), []).unwrap();
+    let exe = release.join("victory.exe");
+    let trace = release.join("trace.txt");
+    let recorder = root.join("Recorder.cs");
+    fs::write(&recorder, r#"using System;
+using System.IO;
+using System.Linq;
+using System.Collections;
+class Recorder {
+    static void Main(string[] args) {
+        var file = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "trace.txt");
+        using (var writer = File.AppendText(file)) {
+            writer.WriteLine("COMMAND");
+            foreach (var arg in args) writer.WriteLine("arg=" + arg);
+            foreach (var pair in Environment.GetEnvironmentVariables().Cast<DictionaryEntry>()
+                     .Where(p => p.Key.ToString().StartsWith("VICTORY_", StringComparison.OrdinalIgnoreCase))
+                     .OrderBy(p => p.Key.ToString(), StringComparer.OrdinalIgnoreCase))
+                writer.WriteLine(pair.Key.ToString().ToUpperInvariant() + "=" + pair.Value);
+        }
+    }
+}"#).unwrap();
+    let csc = PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("Microsoft.NET/Framework64/v4.0.30319/csc.exe");
+    assert!(Command::new(csc).arg("/nologo").arg(format!("/out:{}", exe.display())).arg(recorder).status().unwrap().success());
+    let project = Project { name: "Recorder".into(), repo: "local/3070-parity".into(), branch: None,
+        gpu: vec![], fps: None, render: None, verified: false, summary: String::new(), custom: true,
+        local_exe: Some(exe.display().to_string()), archive_exe: None };
+    let cache = root.join("cache");
+    let data = root.join("save");
+    for flags in [&[][..], &["-Hooks"], &["-ProbeRays"], &["-RayTracing"], &["-ProbeRays", "-RayTracing"],
+        &["-Console", "series-x"], &["-Prewarm"], &["-MipDrop", "0", "-CardBuffersMB", "768", "-CardWindowsMB", "384", "-AutoA", "20"]] {
+        let _ = fs::remove_file(&trace);
+        let result = Command::new("powershell.exe").current_dir(&root)
+            .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"]).arg(&script)
+            .arg("-Game").arg(game.join(EXE_NAME)).args(flags)
+            .env("VICTORY_CACHE_DIR", &cache).env("VICTORY_DATA_DIR", &data)
+            .env("VICTORY_UNUSED_PARENT_FLAG", "1").output().unwrap();
+        assert!(result.status.success(), "{flags:?} {} {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+        let reference = fs::read_to_string(&trace).unwrap();
+        fs::remove_file(&trace).unwrap();
+        let mut switches = format!("{defaults}\nVICTORY_CACHE_DIR={}\nVICTORY_DATA_DIR={}", cache.display(), data.display());
+        for (flag, keys) in [("-Hooks", script_preset::HOOKS), ("-ProbeRays", options.probe_keys()), ("-RayTracing", script_preset::RAY_TRACING)] {
+            if flags.contains(&flag) { script_preset::set_enabled(&mut switches, keys, true); }
+        }
+        if flags.contains(&"-MipDrop") {
+            switches.push_str("\nVICTORY_TEXTURE_MIP_DROP=0\nVICTORY_CARD_BUFFERS_MB=768\nVICTORY_CARD_WINDOWS_MB=384\nVICTORY_AUTO_A=20");
+        }
+        let mut saved = Saved { game_dir: game.display().to_string(), warm_before_play: flags.contains(&"-Prewarm"),
+            warm_pipelines: true, ..Saved::default() };
+        saved.project_launch.insert(project.repo.clone(), ProjectLaunch { switches: Some(switches),
+            args: flags.contains(&"-Console").then(|| "--console series-x".into()), script_options: Some(options), ..Default::default() });
+        let job = Arc::new(Mutex::new(Job::default()));
+        play(&job, &egui::Context::default(), &project, &saved.launch(&project.repo, false), &saves::LaunchSave::Continue).unwrap();
+        assert_eq!(fs::read_to_string(&trace).unwrap(), reference, "script vs Play with {flags:?}");
+        println!("Matched {flags:?} across {} child invocation(s)", reference.matches("COMMAND").count());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 #[ignore = "set MANDYHUB_TEST_SCARLETT_SCRIPT to a trusted play-scarlett.ps1 to compare its child invocations"]
 fn compare_installed_scarlett_script() {

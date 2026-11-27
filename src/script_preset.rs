@@ -42,6 +42,8 @@ fn updates_installed_defaults_and_keeps_profile_edits() {
 #[serde(default)]
 pub struct Options {
     pub shader_pass: bool,
+    pub scarlet_fps: bool,
+    pub foxhound: bool,
     pub ray_tracing: bool,
     pub probe_rays: bool,
     pub probe_rays_single_switch: bool,
@@ -55,6 +57,7 @@ pub const HOOKS: &[&str] = &["VICTORY_GPU_ONLY", "VICTORY_KNOWN_WRITES"];
 
 impl Options {
     pub fn probe_keys(self) -> &'static [&'static str] {
+        if self.scarlet_fps { return &["VICTORY_PROBE_RAYS", "VICTORY_PLANE_NOW"]; }
         if self.probe_rays_single_switch {
             SINGLE_PROBE_RAYS
         } else {
@@ -131,7 +134,30 @@ pub fn parse(script: &str) -> Result<(String, Options), String> {
     if probe_rays_by_default && defaults.get("VICTORY_BVH_BUILDER") != Some(&"1") {
         defaults.insert("VICTORY_PROBE_RAYS", "1");
     }
+    // Recognize the actual 3070 launch contract under either upstream filename.
+    let scarlet_fps = lines.iter().any(|l| l.starts_with("& $exe run $Game --execute --console $Console "))
+        && lines.contains(&"& $exe shaders $gameDir") && lines.contains(&"& $exe warm")
+        && lines.iter().any(|l| l.ends_with("$Console = 'series-s',"));
+    if scarlet_fps {
+        for line in &lines[start..end] {
+            let Some((key, value)) = line.split_once('=') else { continue };
+            let key = key.trim();
+            let Some(param) = value.trim().strip_prefix("\"$").and_then(|s| s.strip_suffix('"')) else { continue };
+            if !matches!(key,"VICTORY_CARD_BUFFERS_MB"|"VICTORY_CARD_WINDOWS_MB"|"VICTORY_TEXTURE_MIP_DROP") { continue; }
+            let declaration = format!("[int]${param} = ");
+            if let Some(number) = lines[..start].iter().find_map(|line| line.split_once(&declaration).map(|(_,v)| v.trim_end_matches(','))) {
+                if number.parse::<u32>().is_ok() { defaults.insert(key, number); }
+            }
+        }
+        if let Some(i) = after.iter().position(|l| *l == "} elseif (-not $RayTracing) {") {
+            defaults.extend(after[i+1..].iter().take_while(|l| **l != "}")
+                .flat_map(|l| assignments(l)).filter_map(|v| literal_assignment(v,Some(&prefix))));
+        }
+    }
     let options = Options {
+        scarlet_fps,
+        foxhound: lines.contains(&"$settings.VICTORY_MENU_FILE = $menuFile")
+            && lines.iter().any(|l| l.contains("& $victory run $Exe --console $console --execute")),
         shader_pass: after.iter().any(|line| line.eq_ignore_ascii_case("& $Victory shaders $rpf")),
         ray_tracing: has_flag(after, &prefix, &["if($raytracing)"], RAY_TRACING),
         probe_rays: probe_rays_single_switch
@@ -296,6 +322,8 @@ if ($AutoStart) { $set.VICTORY_AUTO_INPUT = '1' }
             probe_rays_single_switch: false,
             hooks: true,
             shader_pass: false,
+            scarlet_fps: false,
+            foxhound: false,
         }
     );
     assert_eq!(
