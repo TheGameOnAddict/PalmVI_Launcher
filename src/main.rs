@@ -18,6 +18,7 @@ mod saves;
 mod save_zip;
 mod build_activity;
 mod updater;
+mod script_preset;
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -116,6 +117,30 @@ struct Saved {
     /// Extra arguments for `victory run`; the game's own go after `--`.
     launch_args: String,
     project_launch: std::collections::BTreeMap<String, ProjectLaunch>,
+    launch_presets: Vec<LaunchPreset>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LaunchPreset {
+    name: String,
+    args: String,
+    switches: Option<String>,
+    #[serde(default)]
+    script_options: Option<script_preset::Options>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    projects: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repo_script: Option<String>,
+}
+
+impl LaunchPreset {
+    fn apply(&self, launch: &mut ProjectLaunch) {
+        launch.args = Some(self.args.clone());
+        if let Some(switches) = &self.switches {
+            launch.switches = Some(switches.clone());
+            launch.script_options = self.script_options;
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -123,8 +148,19 @@ struct Saved {
 struct ProjectLaunch {
     args: Option<String>,
     switches: Option<String>,
+    script_options: Option<script_preset::Options>,
+    selected_preset: Option<String>,
+    preset_choice_confirmed: bool,
+    /// Records a custom script accepted by an earlier build.
+    confirmed_repo_script: Option<String>,
     graphics: Option<GraphicsSettings>,
     notes: String,
+}
+
+impl ProjectLaunch {
+    fn has_confirmed_preset(&self) -> bool {
+        self.preset_choice_confirmed || self.selected_preset.is_some() || self.confirmed_repo_script.is_some()
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -272,6 +308,7 @@ struct Launch {
     output: OutputResolution,
     /// `VICTORY_*` lines: the player's switches and the graphics fixes.
     extra: String,
+    use_script_defaults: bool,
     fullscreen: bool,
     warm_first: bool,
     pipelines: bool,
@@ -334,6 +371,7 @@ struct App {
     /// The project an uninstall is being confirmed for.
     confirm_uninstall: Option<String>,
     save_picker: Option<ui::SavePicker>,
+    play_preset_picker: Option<ui::PlayPresetPicker>,
     /// A new install folder waiting for "move the projects there?" (from, to).
     pending_move: Option<(PathBuf, PathBuf)>,
     /// The folder the files were checked in was empty.
@@ -934,6 +972,7 @@ impl App {
             tools: None,
             confirm_uninstall: None,
             save_picker: None,
+            play_preset_picker: None,
             pending_move: None,
             empty: false,
             finding: Arc::new(Mutex::new(None)),
@@ -1084,6 +1123,7 @@ impl App {
             self.show_log = true;
         }
         self.log_export_status = None;
+        let settings = self.saved.project_launch.get(&project_key(&p.repo));
         let (args, extra) = self.saved.launch_overrides(&p.repo);
         let graphics = self.saved.graphics_for(&p.repo);
         let launch = Launch {
@@ -1092,12 +1132,12 @@ impl App {
             scale: graphics.render_scale,
             output: graphics.output,
             extra,
+            use_script_defaults: settings.is_some_and(|settings| settings.switches.is_some() && settings.script_options.is_some()),
             fullscreen: graphics.fullscreen,
             warm_first: self.saved.warm_before_play,
             pipelines: self.saved.warm_pipelines,
             args,
-            program_args: self.saved.project_launch.get(&project_key(&p.repo))
-                .and_then(|settings| settings.args.as_deref()).map(split_args).unwrap_or_default(),
+            program_args: settings.and_then(|settings| settings.args.as_deref()).map(split_args).unwrap_or_default(),
         };
         let (ctx, repos) = (ctx.clone(), self.repos.clone());
         std::thread::spawn(move || {
@@ -1283,14 +1323,20 @@ fn victory_env(c: &mut Command, p: &Project, l: &Launch) {
     if let Some(program) = p.archive_program() {
         if let Some(directory) = program.parent() {
             c.current_dir(directory);
-            for (key, value) in build_zip::launch_defaults(directory) {
-                c.env(key, value);
+            if !l.use_script_defaults {
+                for (key, value) in build_zip::launch_defaults(directory) {
+                    c.env(key, value);
+                }
             }
         }
         c.env("VICTORY_GAME_DIR", &l.game_dir);
+    } else if l.use_script_defaults {
+        c.env("VICTORY_GAME_DIR", &l.game_dir);
     }
-    for (k, v) in detect_launch_env(&repo_dir(&p.repo)) {
-        c.env(&k, &v);
+    if !l.use_script_defaults {
+        for (k, v) in detect_launch_env(&repo_dir(&p.repo)) {
+            c.env(&k, &v);
+        }
     }
     if l.series_s {
         c.env("VICTORY_OWN_UPSCALER", "1");

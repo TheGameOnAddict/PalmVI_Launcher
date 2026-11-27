@@ -45,6 +45,8 @@ keeps the files under `deleted-saves` in its install folder for recovery.
 - **Uninstall:** removes a project's download, build and shader cache (saves stay).
 - **Game files check:** choose your game files folder to enable Play on VIctory builds.
 - **Project profiles** keep launch arguments, environment switches, and private notes for each build.
+- **Launch presets** are in **Launch Settings**. Paste raw arguments and switches into the project fields, then use **Save as preset…** to save both under a name. In **Saved presets**, apply or delete an existing preset, or use **Import file…** or **Paste preset text…** to add one someone shared.
+- **PowerShell presets** read literal `VICTORY_*` defaults from scripts such as `play-scarlett.ps1`. Mandyhub preselects a detected custom script in **Launch Settings** and offers it the first time you press **Play**. Confirm your choice once and Mandyhub uses those profile settings on later launches. Applying the script exposes any recognized Ray tracing, Probe rays, and Hooks toggles. Use **Import file…** to select another script.
 - **Build tracking:** see when you last ran a build and spot installs and updates you have yet to try.
 - **Screenshot mode** replaces repo names and links with examples and hides private details such as paths, notes, and logs.
 - **Compatibility:** build forks with a nested Cargo workspace and use shader warm-up on Scarlett builds that provide the `shaders` command.

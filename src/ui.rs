@@ -10,7 +10,10 @@ use eframe::egui::{self, vec2, Align, Color32, Frame, Label, Layout, Margin, Ric
 use std::time::Duration;
 
 mod save_picker;
+mod launch_presets;
 pub(crate) use save_picker::SavePicker;
+mod play_preset_picker;
+pub(crate) use play_preset_picker::PlayPresetPicker;
 
 /// The graphics modes: name, Series S profile, render scale, what it does.
 const MODES: [(&str, bool, f32, &str); 3] = [
@@ -522,7 +525,35 @@ impl App {
         } else {
             ("From PortWatch", theme::LILAC)
         };
-        theme::caps(ui, eyebrow, 11.5, eyebrow_color);
+        let folder_error = ui.make_persistent_id(("open-profile-folder", &p.repo));
+        ui.horizontal(|ui| {
+            theme::caps(ui, eyebrow, 11.5, eyebrow_color);
+            if self.screenshot_projects.is_none() {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let folder = p.local_exe.as_deref()
+                        .and_then(|exe| std::path::Path::new(exe).parent())
+                        .map_or_else(|| crate::repo_dir(&p.repo), std::path::Path::to_path_buf);
+                    let available = folder.is_dir();
+                    let tooltip = if available {
+                        folder.display().to_string()
+                    } else {
+                        "Install the project to open its folder.".into()
+                    };
+                    if theme::small(ui, Look::Secondary, Some(glyph::FOLDER), "Open profile folder", available)
+                        .on_hover_text(tooltip)
+                        .clicked()
+                    {
+                        let error = std::process::Command::new("explorer").arg(&folder).spawn().err();
+                        ctx.data_mut(|data| data.insert_temp(folder_error, error.map(|error| error.to_string())));
+                    }
+                });
+            }
+        });
+        if self.screenshot_projects.is_none() {
+            if let Some(error) = ctx.data(|data| data.get_temp::<Option<String>>(folder_error)).flatten() {
+                wrapped(ui, &format!("Could not open the profile folder: {error}"), theme::BAD);
+            }
+        }
         let width = ui.available_width();
         let alias = self.screenshot_alias(&p.repo);
         let private = alias.is_some();
@@ -574,10 +605,14 @@ impl App {
             };
             let enabled = !running && if installed { runnable || (victory && app.files_ok()) } else { p.is_git() && tools_ok };
             if theme::button_ex(ui, Look::Primary, Size::Large, icon, label, enabled, this_job).clicked() {
-                if installed && runnable {
-                    app.start(ctx, p.clone(), Kind::Play(crate::saves::LaunchSave::Continue));
-                } else if installed {
-                    app.save_picker = Some(SavePicker::new(p.clone()));
+                if installed {
+                    app.play_preset_picker = (!private).then(|| {
+                        let launch = app.saved.project_launch.get(&project_key(&p.repo));
+                        PlayPresetPicker::for_project(p, &app.saved.launch_presets, launch)
+                    }).flatten();
+                    if app.play_preset_picker.is_none() {
+                        app.continue_play(ctx, p.clone());
+                    }
                 } else {
                     app.start(ctx, p.clone(), Kind::Install);
                 }
@@ -821,7 +856,8 @@ impl App {
         }
         let key = project_key(&project.repo);
         if self.saved.project_launch.get(&key).is_some_and(|launch| {
-            launch.args.is_none() && launch.switches.is_none() && launch.graphics.is_none() && launch.notes.is_empty()
+            launch.args.is_none() && launch.switches.is_none() && launch.graphics.is_none()
+                && launch.notes.is_empty() && !launch.has_confirmed_preset()
         }) {
             self.saved.project_launch.remove(&key);
         }
@@ -890,44 +926,10 @@ impl App {
     fn project_launch_card(&mut self, ui: &mut Ui, project: &Project) {
         let global_args = &self.saved.launch_args;
         let global_switches = &self.saved.extra_env;
-        let launch = self.saved.project_launch.entry(project_key(&project.repo)).or_default();
-        if project.runs_standalone() {
-            section(ui, "Program arguments", None, "Passed directly to the program when it starts.", |ui| {
-                let args = launch.args.get_or_insert_with(String::new);
-                theme::field(ui, args, "--example", ui.available_width(), None);
-            });
-            if launch.args.as_deref() == Some("") {
-                launch.args = None;
-            }
-            return;
-        }
-        section(ui, "Project launch settings", None, "Applies to this project only. Each field can use its global default or a project-specific value.", |ui| {
-            let mut custom_args = launch.args.is_some();
-            if ui.checkbox(&mut custom_args, "Use project launch arguments").changed() {
-                launch.args = custom_args.then(|| global_args.clone());
-            }
-            if let Some(args) = &mut launch.args {
-                note(ui, "Arguments for the game itself go after --.");
-                let width = ui.available_width();
-                theme::field(ui, args, "--strict -- -title-argument", width, None);
-            } else if !global_args.trim().is_empty() {
-                wrapped(ui, global_args, theme::FAINT);
-            }
-            ui.add_space(10.0);
-            let mut custom_switches = launch.switches.is_some();
-            if ui.checkbox(&mut custom_switches, "Use project launch switches").changed() {
-                launch.switches = custom_switches.then(|| global_switches.clone());
-            }
-            if let Some(switches) = &mut launch.switches {
-                note(ui, "Enter one VICTORY_NAME=value switch per line.");
-                let width = ui.available_width();
-                ui.add(egui::TextEdit::multiline(switches)
-                    .font(theme::mono(12.5))
-                    .hint_text("VICTORY_NAME=value")
-                    .desired_rows(4)
-                    .desired_width((width - 28.0).max(0.0))
-                    .margin(Margin::symmetric(14.0, 10.0)));
-            }
+        let key = project_key(&project.repo);
+        let launch = self.saved.project_launch.entry(key.clone()).or_default();
+        ui.push_id(key, |ui| {
+            launch_presets::show(ui, &mut self.saved.launch_presets, launch, global_args, global_switches, project);
         });
     }
 
@@ -1319,6 +1321,14 @@ impl App {
         });
     }
 
+    fn continue_play(&mut self, ctx: &egui::Context, project: Project) {
+        if project.runs_standalone() {
+            self.start(ctx, project, Kind::Play(crate::saves::LaunchSave::Continue));
+        } else {
+            self.save_picker = Some(SavePicker::new(project));
+        }
+    }
+
     /// The open dialog, if any: add a repo, uninstall, or move the install folder.
     fn dialogs(&mut self, ctx: &egui::Context) {
         let now = ctx.input(|i| i.time);
@@ -1326,7 +1336,8 @@ impl App {
             let job = self.job.lock().unwrap();
             (job.running, job.import_error.clone())
         };
-        let open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some() || self.save_picker.is_some() || import_error.is_some();
+        let open = self.add_repo.is_some() || self.confirm_uninstall.is_some() || self.pending_move.is_some()
+            || self.save_picker.is_some() || self.play_preset_picker.is_some() || import_error.is_some();
         if open && !self.modal_was_open {
             self.modal_at = now;
         }
@@ -1337,9 +1348,34 @@ impl App {
             let alias = self.screenshot_alias(&picker.project.repo).map(|(name, _)| name);
             let (action, dismissed) = picker.show(ctx, t0, !running && self.files_ok(), alias.as_deref());
             match action {
-                save_picker::Action::Launch(choice) if !dismissed => self.start(ctx, picker.project, Kind::Play(choice)),
+                save_picker::Action::Launch(choice) if !dismissed => {
+                    self.start(ctx, picker.project, Kind::Play(choice));
+                }
                 save_picker::Action::Keep if !dismissed => self.save_picker = Some(picker),
                 _ => {}
+            }
+        }
+
+        if let Some(mut picker) = self.play_preset_picker.take() {
+            let (accepted, dismissed) = picker.show(ctx, t0);
+            if !dismissed {
+                if accepted && !running {
+                    let (project, preset) = picker.into_choice();
+                    let key = project_key(&project.repo);
+                    let launch = self.saved.project_launch.entry(key.clone()).or_default();
+                    if let Some(preset) = preset {
+                        if let Err(error) = launch_presets::apply_to_profile(&mut self.saved.launch_presets, launch, &key, preset) {
+                            self.job.lock().unwrap().log.push(format!("Could not apply launch preset: {error}"));
+                            self.show_log = true;
+                            return;
+                        }
+                    }
+                    launch.preset_choice_confirmed = true;
+                    self.continue_play(ctx, project);
+                    ctx.request_repaint();
+                } else {
+                    self.play_preset_picker = Some(picker);
+                }
             }
         }
 
