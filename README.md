@@ -98,10 +98,20 @@ cargo build --release
 
 The launcher is `target\release\mandyhub.exe`.
 
-Before publishing a Windows release, scan the final executable on the release PC. If you sign the executable, scan it after signing.
+### Verify a release build
+
+For releases built by GitHub Actions, the release notes include **Build and upload log** and **Verify this build**. The first link shows the workflow that compiled and uploaded the executables. The second opens the signed build record. To check your downloaded file with the GitHub CLI, replace `vX.Y.Z` with the release tag:
 
 ```powershell
-.\scripts\Test-ReleaseBinary.ps1 -Path .\target\release\mandyhub.exe
+gh attestation verify .\PalmVI.exe --repo TheGameOnAddict/PalmVI_Launcher --signer-workflow TheGameOnAddict/PalmVI_Launcher/.github/workflows/release.yml --source-ref refs/tags/vX.Y.Z --deny-self-hosted-runners
+```
+
+### Prepare a release
+
+Push a stable version tag matching `Cargo.toml` to run the Windows tests, build the executable and generate its attestation. The workflow uploads the same executable as `PalmVI.exe` and `Mandyhub.exe` to a draft release. Download the draft executable for the Defender scan below, review the release notes, then publish the draft. The **Run workflow** button in Actions tests the build and attestation without creating a release.
+
+```powershell
+.\scripts\Test-ReleaseBinary.ps1 -Path .\PalmVI.exe
 ```
 
 The check prints the Defender definition version and the SHA-256 to match against the uploaded GitHub asset. If Defender flags a build, hold that release and submit the exact file for [Microsoft developer review](https://www.microsoft.com/en-us/wdsi/filesubmission).

@@ -1,0 +1,60 @@
+name: Build PalmVI release
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths: ['.github/workflows/release.yml']
+    tags: ['v*']
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: windows-2025
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Check release version
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        run: |
+          $metadata = cargo metadata --locked --no-deps --format-version 1 | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = ($metadata.packages | Where-Object name -eq 'mandyhub').version
+          if ($version -notmatch '^\d+\.\d+\.\d+$' -or $env:GITHUB_REF_NAME -cne "v$version") {
+            throw "Release tag must match the stable Cargo version ($version)."
+          }
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build Windows executable
+        run: cargo build --release --locked
+
+      - name: Prepare updater downloads
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          Copy-Item target/release/mandyhub.exe dist/PalmVI.exe
+          Copy-Item dist/PalmVI.exe dist/Mandyhub.exe
+
+      - name: Attest both release filenames
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-path: dist/*.exe
+
+      - name: Upload executables to a draft GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ATTESTATION_URL: ${{ steps.provenance.outputs.attestation-url }}
+        run: |
+          $runUrl = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+          $notes = "[Build and upload log]($runUrl) · [Verify this build]($env:ATTESTATION_URL)"
+          gh release create "$env:GITHUB_REF_NAME" dist/PalmVI.exe dist/Mandyhub.exe --repo "$env:GITHUB_REPOSITORY" --verify-tag --draft --generate-notes --notes "$notes"
