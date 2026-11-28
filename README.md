@@ -132,6 +132,12 @@ The check prints the Defender definition version and the SHA-256 to match agains
 
 The display type is Josefin Sans and Big Shoulders Display, built into the exe from `fonts/` under the SIL Open Font License (license texts in `fonts/`). Reading text and icons use Windows' own Segoe UI and Segoe Fluent Icons.
 
+## License
+
+Original PalmVI source code and modifications authored for PalmVI are licensed under the GNU General Public License, version 3 or any later version (`GPL-3.0-or-later`). See [LICENSE](LICENSE) for the full text.
+
+Code inherited from Mandyhub and third-party material retain their applicable copyright and license terms. See [Fonts](#fonts) for the bundled fonts' license.
+
 ## Credits
 
 PalmVI builds on the original Mandyhub launcher by **Zettrox**. Project list from [PortWatch](https://portwatch-vi.xyz). The projects are their authors' work, built on VIctory by Marvisak and its contributors.
