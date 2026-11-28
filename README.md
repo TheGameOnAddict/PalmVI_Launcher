@@ -1,4 +1,4 @@
-# PalmVI Launcher
+# <img src="data/palmvi.png" width="48" height="48" align="absmiddle" alt=""> PalmVI Launcher
 
 PalmVI is a Windows launcher for VIctory builds, prebuilt ZIPs and standalone Rust projects. Keep builds side by side, start them from the same save, and compare how they run on your PC.
 
@@ -98,6 +98,8 @@ No game files are included or downloaded. You need your own copy of the game.
 ## Requirements
 
 - Windows 10 or 11, 64-bit
+- On supported Windows 10 builds, **Install**, **Update**, and **Reinstall** automatically configure the Agility SDK for compatible x64 VIctory source projects. PalmVI checks the SDK version and folder exported by the player, enables the project's Agility feature when available, and supplies missing declarations during linking. The install log shows the runtime version and location. For an existing installation, choose **Reinstall** once after updating PalmVI.
+- PalmVI can reuse the project's runtime, a DLL selected through `VICTORY_D3D12_CORE`, or a matching x64 Microsoft NuGet installation. For the default SDK 620 it can also fetch and cache Microsoft's hash-verified 1.620.2 runtime. Prebuilt executables require their publisher to include Agility support.
 - To build projects: Git, Rust and the C++ build tools. PalmVI finds them where their installers put them, and **Install missing tools for me** installs what is missing with winget (Windows asks for permission).
 
 ## Build

@@ -8,6 +8,14 @@ fn main() {
         return;
     }
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    if target == "x86_64-pc-windows-msvc" {
+        println!("cargo:rerun-if-changed=data/agility.c");
+        let mut cl = find_msvc_tools::find(&target, "cl.exe").unwrap_or_else(|| Command::new("cl.exe"));
+        let status = cl.args(["/nologo", "/c", "/Zl", "data/agility.c"])
+            .arg(format!("/Fo{}", out.join("agility.obj").display()))
+            .status().expect("Windows C compiler");
+        assert!(status.success(), "Could not compile the Agility SDK declarations");
+    }
     let (mut compiler, resource) = if target.ends_with("msvc") {
         let mut rc =
             find_msvc_tools::find(&target, "rc.exe").unwrap_or_else(|| Command::new("rc.exe"));

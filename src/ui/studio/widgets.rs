@@ -78,29 +78,30 @@ pub(super) fn fade_edges(
 
 pub(super) fn palm(ui: &mut Ui) {
     let (r, _) = ui.allocate_exact_size(vec2(42.0, 43.0), Sense::hover());
-    let point = |x: f32, y: f32| r.min + vec2(x * 0.88, y * 0.88 + 2.0);
-    let p = ui.painter();
-    let stroke = Stroke::new(2.0_f32, theme::pink());
-    p.line_segment([point(6.0, 39.0), point(38.0, 39.0)], stroke);
-    for [(x, y), (cx, cy), (ex, ey)] in [
-        [(17., 35.), (24., 24.), (25., 12.)],
-        [(25., 12.), (12., 5.), (4., 15.)],
-        [(4., 15.), (14., 12.), (21., 13.)],
-        [(25., 12.), (18., 1.), (10., 4.)],
-        [(10., 4.), (17., 7.), (21., 12.)],
-        [(25., 12.), (30., 2.), (39., 4.)],
-        [(39., 4.), (32., 7.), (28., 13.)],
-        [(25., 12.), (36., 9.), (40., 18.)],
-        [(40., 18.), (33., 13.), (28., 13.)],
-        [(25., 12.), (30., 13.), (31., 23.)],
-    ] {
-        p.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
-            [point(x, y), point(cx, cy), point(ex, ey)],
-            false,
-            Color32::TRANSPARENT,
-            stroke,
-        ));
-    }
+    let id = egui::Id::new("palmvi-sidebar-logo");
+    let colors = [theme::pink(), theme::good()];
+    let cached = ui.ctx().data(|d| d.get_temp::<([Color32; 2], egui::TextureHandle)>(id));
+    let texture = match cached {
+        Some((palette, texture)) if palette == colors => texture,
+        _ => {
+            let mut mark = image::load_from_memory(include_bytes!("../../../data/palmvi-mark.png"))
+                .expect("bundled PalmVI logo")
+                .into_rgba8();
+            for pixel in mark.pixels_mut() {
+                let color = if pixel[1] > pixel[0] { colors[1] } else { colors[0] };
+                pixel.0 = [color.r(), color.g(), color.b(), pixel[3]];
+            }
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [mark.width() as usize, mark.height() as usize],
+                mark.as_raw(),
+            );
+            let texture = ui.ctx().load_texture("PalmVI logo", image, egui::TextureOptions::LINEAR);
+            ui.ctx().data_mut(|d| d.insert_temp(id, (colors, texture.clone())));
+            texture
+        }
+    };
+    let bounds = egui::Rect::from_center_size(r.center(), vec2(42.0, 42.0));
+    egui::Image::new(&texture).paint_at(ui, bounds);
 }
 pub(super) fn nav_item(
     ui: &mut Ui,

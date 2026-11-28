@@ -70,6 +70,7 @@ struct Project {
 mod build_zip;
 mod rust_project;
 mod nvidia_rt;
+mod agility;
 
 impl Project {
     fn is_git(&self) -> bool {
@@ -781,9 +782,16 @@ fn target_dir(repo: &str) -> PathBuf {
     workspace().join("target").join(slug(repo))
 }
 fn built_exe(repo: &str) -> PathBuf {
+    let target = target_dir(repo);
+    if let Ok(record) = std::fs::read_to_string(target.join("victory-binary.txt")) {
+        let relative = Path::new(&record);
+        if relative.file_name().is_some_and(|n| n == "victory.exe")
+            && relative.components().all(|c| matches!(c, std::path::Component::Normal(_))) {
+            return target.join(relative);
+        }
+    }
     let dir = repo_dir(repo);
     let workspace = cargo_workspace(&dir).unwrap_or_else(|_| dir.clone());
-    let target = target_dir(repo);
     let executable = target.join(detect_build_profile(&workspace)).join("victory.exe");
     let previous = target.join("release").join("victory.exe");
     if !executable.is_file() && (documented_scarlet_script(&workspace).is_some() || nvidia_rt::has_overlay_player(&workspace)) {
@@ -1604,6 +1612,22 @@ fn install(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, updating: bo
     Ok(())
 }
 
+fn cargo_artifacts(job: &Arc<Mutex<Job>>, ctx: &egui::Context, cargo: &mut Command) -> Result<Vec<serde_json::Value>, String> {
+    cargo.arg("--message-format=json-render-diagnostics");
+    let artifacts = Arc::new(Mutex::new(Vec::new()));
+    let captured = artifacts.clone();
+    run_with_output(job, ctx, cargo, None, |_| {}, move |line| {
+        let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else { return Some(line) };
+        if message["reason"] == "compiler-artifact" && message["executable"].is_string() {
+            captured.lock().unwrap().push(message);
+            return None;
+        }
+        message["message"]["rendered"].as_str().map(str::to_owned)
+    })?;
+    let result = std::mem::take(&mut *artifacts.lock().unwrap());
+    Ok(result)
+}
+
 fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &Path, target: &Path) -> Result<(), String> {
     let workspace = cargo_workspace(dir)?;
     let metadata = rust_project::metadata(&workspace)?;
@@ -1619,10 +1643,10 @@ fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &
     cargo.current_dir(&workspace);
     if victory {
         cargo.args(["-p", "victory"]);
-        if documented_scarlet_script(&workspace).is_some() { cargo.args(["--bin", "victory"]); }
-        if nvidia_rt::supported(&workspace) && nvidia_rt::needs_agility()? {
-            stage(job, ctx, "Preparing Microsoft D3D12 Agility for the Windows 10 build");
-            nvidia_rt::install_agility(&target.join(profile))?;
+        let configure_agility = agility::compatible(&metadata) && agility::windows_10()?;
+        let native_agility = configure_agility && agility::native_feature(&metadata);
+        if native_agility || documented_scarlet_script(&workspace).is_some() { cargo.args(["--bin", "victory"]); }
+        if native_agility {
             cargo.args(["--features", "agility"]);
         }
         // Scarlett's diag profile and Cargo's diagnostics feature are separate switches.
@@ -1635,28 +1659,27 @@ fn build_project(job: &Arc<Mutex<Job>>, ctx: &egui::Context, p: &Project, dir: &
             cargo.args(["--features", "diagnostics"]);
             job.lock().unwrap().log.push("Building with the Scarlett launcher's diagnostics feature.".into());
         }
-        run(job, ctx, &mut cargo)?;
-        let executable = target.join(profile).join("victory.exe");
-        if !executable.is_file() {
-            return Err(format!("the build made no {}", executable.display()));
+        let artifacts = cargo_artifacts(job, ctx, &mut cargo)?;
+        let player = artifacts.iter().find(|a| a["target"]["name"] == "victory"
+            && a["target"]["kind"].as_array().is_some_and(|k| k.iter().any(|v| v == "bin")))
+            .and_then(|a| a["executable"].as_str()).ok_or("Cargo did not report a victory executable")?;
+        let executable = Path::new(player);
+        let relative = executable.strip_prefix(target).map_err(|_| "Cargo reported a player outside the install folder")?;
+        if !executable.is_file() { return Err(format!("the build made no {}", executable.display())); }
+        if configure_agility {
+            agility::configure(job, ctx, &cargo, executable, target, dir)?;
         }
+        let record = target.join("victory-binary.txt");
+        let temp = record.with_extension("tmp");
+        std::fs::write(&temp, relative.to_str().ok_or("Invalid Cargo executable path")?)
+            .and_then(|_| std::fs::rename(temp, record)).map_err(|e| format!("Could not record the player path: {e}"))?;
         let marker = rust_install_file(&p.repo);
         if marker.exists() {
             std::fs::remove_file(marker).map_err(|error| error.to_string())?;
         }
     } else {
-        cargo.args(["--workspace", "--message-format=json-render-diagnostics"]);
-        let artifacts = Arc::new(Mutex::new(Vec::new()));
-        let captured = artifacts.clone();
-        run_with_output(job, ctx, &mut cargo, None, |_| {}, move |line| {
-            let Ok(message) = serde_json::from_str::<serde_json::Value>(&line) else { return Some(line) };
-            if message["reason"] == "compiler-artifact" && message["executable"].is_string() {
-                captured.lock().unwrap().push(message);
-                return None;
-            }
-            message["message"]["rendered"].as_str().map(str::to_owned)
-        })?;
-        let artifacts = artifacts.lock().unwrap();
+        cargo.arg("--workspace");
+        let artifacts = cargo_artifacts(job, ctx, &mut cargo)?;
         let executable = rust_project::select_executable(&metadata, &artifacts)
             .map(|exe| Path::new(exe).strip_prefix(target).map(Path::to_owned))
             .transpose().map_err(|_| "Cargo reported an executable outside the install folder")?;
